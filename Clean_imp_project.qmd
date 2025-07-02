@@ -1,0 +1,3522 @@
+---
+title: "Cleaning and imputation of the project dataset"
+author: "Aleksandr Dulepov"
+format: pdf
+editor: visual
+---
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(haven)
+library(naniar)
+library(mice) #mice
+library(visdat) #missings visualization
+library(VIM) #knn, hotdeck, missings visualization
+library(tidyr) #data wrangling
+library(reshape2)
+library(DescTools)
+library(tableone)    # creating descriptive tables
+library(knitr)       # for tables 
+library(kableExtra)  # optional, for extra styling
+library(htmlTable)   # for tables
+library(gridExtra)
+library(forcats)
+library(purrr) # Flexible functional programming
+library(pheatmap) #heatmap
+library(olsrr)
+```
+
+# Data cleaning
+
+## Load dataset
+
+```{r}
+c66_project_df <- readRDS("//kaappi.oulu.fi/nfbc$/projects/P0511/Alex/1_c66_project_df.rds")
+```
+
+## Variables datatype
+
+Check whether a column reflects a correct datatype.
+
+```{r}
+glimpse(c66_project_df)
+```
+
+**Conclusion:** All variables have correct datatypes.
+
+## Full and partial duplicates
+
+Check for full and partial duplicates. Full duplicates are completely identical, while partial can differ in some variables (columns).
+
+```{r}
+# Find duplicated project_ID
+c66_project_df %>% 
+  count(project_ID) %>% 
+  filter(n > 1) 
+
+#0 values
+```
+
+**Conclusion:** The dataset does not contain duplicates.
+
+## Incorrectly specified NA values
+
+Check whether the dataset has incorrectly specified values like "NA", "missing", etc.
+
+```{r}
+#check for strings that are the most common incorrectly specified NA 
+miss_scan_count(c66_project_df, search = list("missing", "NA", "N A", "NaN", "N/A", "#N/A",
+                                              "NA ", " NA", "N /A", "N / A", " N / A", "N / A ",
+                                              "^na", "n a", "n/a","na "," na","n /a","n / a",
+                                              " a / a", "n / a ", "NULL","null", "^ ", -99, "^\\.$",
+                                              "^$", "^\\?$", "^\\*$"))
+#0 values
+
+#^: The start of the string.
+#\\.: A literal dot 
+#$: The end of the string.
+```
+
+**Conclusion:** The dataset does not contain incorrectly specified values.
+
+## Possible issues with factor labels and strings
+
+1\) Check whether the same categorical variables are written differently, containing unnecessary "High" cases or spaces before or after the word (inconsistency), or reflecting the same group but consisting of different names =\> transform everything into lowercase and delete spaces and collapse into one variable (if needed).
+
+```{r}
+ 
+summary(c66_project_df)
+
+#All categorical variables have correct groupings. No changes are needed.
+```
+
+2\) Check whether some inputs (rows) contain special symbols, and some do not (parentheses, hyphens, spaces) =\> bring everything in a single format.
+
+```{r}
+
+summary(c66_project_df)
+
+#The factor labels contain some symbols (space and hyphens), but they do not require any change.
+```
+
+3\) Check whether strings contain different amounts of symbols =\> exclude rows with incomplete values
+
+The dataset does not contain any character/string variables except project_ID.
+
+## Uniqueness of continuous variables
+
+Count the number of unique values for all continuous variables. If there is a few -\> change to factor.
+
+```{r}
+# Identify numeric columns
+other_vars <- names(c66_project_df)[sapply(c66_project_df, is.numeric)]
+
+# Loop through numeric columns and compute the length of unique values
+for (i in other_vars) {
+  print(i)
+  print(length(unique(c66_project_df[[i]])))  # Correct way to access dynamic column names
+}
+```
+
+All continuous variables have sufficient amount of unique values.
+
+## Sparse of categorical variables
+
+Check for sparse categorical variables (levels that have a small sample size). If there are few samples -\> collapse.
+
+```{r}
+c66_project_df %>% 
+  Hmisc::describe()
+```
+
+There are few values for occupational status variable `c66_46_occup` , subgroup Domestic tasks, Inactive/other. It will be collapsed with the "Unemployed" subgroup. Students and self-employed might be a proxy for high risks taking persons. Recheck the categories after for validity.
+
+```{r}
+c66_project_df <- c66_project_df %>% 
+  mutate(c66_46_occup_col = fct_collapse(c66_46_occup ,
+                                     "Unemployed" = c("Domestic tasks", "Inactive/other", 
+                                                      "Unemployed")))
+
+# Check derivation
+TAB <- table(c66_project_df$c66_46_occup, c66_project_df$c66_46_occup_col,
+             useNA = "ifany")
+addmargins(TAB, 1) # Adds a row of column totals
+
+c66_project_df <- c66_project_df %>% 
+  mutate(c66_46_occup = c66_46_occup_col) %>%
+  select(-c66_46_occup_col)
+
+summary(c66_project_df)
+```
+
+## Visualizing the unadjusted relationships
+
+Before fitting the model, visualize the association between the outcome and each predictor. If the plots looks strange, go back and look at the code to check whether variables were coded correctly.
+
+```{r}
+source("Functions_rmph.R")
+vars = colnames(c66_project_df)[-1]
+
+for (i in vars) {
+# Change margins
+# Default par(mar=c(5, 4, 4, 2) + 0.1) for c(bottom, left, top, right)
+par(mar=c(4.5, 4, 1, 1))
+par(mfrow=c(2,3))
+plotyx("c66_46_avrsybp", i,  c66_project_df,
+       ylab = "Systolic BP", xlab = i)
+}
+```
+
+All unadjusted relationships look adequate.
+
+## Skewness of the outcome variables
+
+Examine the distribution of the outcome variables using qq-plot and histograms.
+
+```{r}
+# Identify outcome columns
+other_vars <- names(c66_project_df[,c("c66_46_cimt_l_avg","c66_46_cimt_r_avg", 
+                                      "c66_46_avrsybp" , "c66_46_avrdibp")])
+
+# Loop through all variables in other_vars
+for (var in other_vars) {
+  # Create histogram
+  p1 <- c66_project_df %>%
+    ggplot(aes(x = .data[[var]])) +
+    geom_histogram(fill = "steelblue", color = "white") +
+    labs(title = paste("Histogram of", var), x = var, y = "Count") +
+    theme_minimal()
+
+  # Create QQ plot
+  p2 <- c66_project_df %>%
+    ggplot(aes(sample = .data[[var]])) +
+    stat_qq() +
+    stat_qq_line(color = "red") +
+    labs(title = paste("QQ Plot of", var), x = "Theoretical Quantiles", y = "Sample Quantiles") +
+    theme_minimal()
+
+  # Print the two plots
+  print(p1)
+  print(p2)
+}
+```
+
+The significant skewness does present in both outcomes. However, the sample size (\>5700 obs for blood pressure and 1110 for CIMT) is large enough to neglect the skewness and keep the original scale to facilitate interpretability. Sensitivity analysis will be performed to assess how does transformation (Box-Cox transformation) affect the estimates and standard errors.
+
+**According to the transform-then-impute rule, we should create transformed variables before imputing. This approach preserves the relationships between variables in the regression model, as opposed to impute-then-transform which can distort the relationships between variables. Therefore, during the sensitivity analysis a new imputation model with transformed variables instead of original ones will be executed.**
+
+## Univariable outliers detection
+
+```{r}
+#| warning: false
+# Identify numeric columns, excluding "c66_46_avrsybp"
+other_vars <- names(c66_project_df)[sapply(c66_project_df, is.numeric)]
+other_vars <- setdiff(other_vars, "c66_46_avrsybp")  # Exclude the outcome variable
+
+# Loop through all variables in other_vars
+for (var in other_vars) {
+  # Create boxplot (use `.data[[var]]` to reference variable dynamically)
+  p1 <- c66_project_df %>%
+    ggplot(aes(x = "", y = .data[[var]])) +
+    geom_boxplot() +
+    labs(title = paste("Boxplot of", var))
+
+  # Create scatter plot (with c66_46_avrsybp on the y-axis)
+  p2 <- c66_project_df %>%
+    ggplot(aes(x = .data[[var]], y = c66_46_avrsybp)) +
+    geom_point() +
+    labs(title = paste("Scatterplot of", var, "vs c66_46_avrsybp"))
+  
+  # Create scatter plot (with c66_46_avrsybp on the y-axis)
+  p3 <- c66_project_df %>%
+    ggplot(aes(x = .data[[var]])) +
+    geom_histogram() +
+    labs(title = paste("Hist of", var))
+
+  # Print the two plots
+  print(p1)
+  print(p2)
+  print(p3)
+} #check bmi with and without outl
+```
+
+**Average temperature**: 3 data points between -2.5 and and 0 and 2 points \> 8.5 can be considered as outliers. All values should be deleted or replaced with a lowest/highest reasonable value (better approach). #compare with substitution and without
+
+**Temperature standard deviation**: 1 outlier has temp sd less than 6 and more than 11. These points might significantly affect the model's performance. They should be deleted or replaced with the lowest/highest reasonable value (better approach).
+
+**Average apparent temperature:** Similar results to the average temperature. Outliers should be deleted or replaced with a lowest/highest reasonable value (better approach).
+
+**Apparent temperature standard deviation:** Similar results to the temperature standard deviation. Outliers should be deleted or replaced with the lowest/highest reasonable value (better approach).
+
+**Average day temperature on the day of the assessment:** No outliers were detected.
+
+**Average systolic blood pressure:** All boxplot outliers are biologically plausible.
+
+**Average diastolic blood pressure:** All boxplot outliers are biologically plausible.
+
+**BMI:** Potential outliers with bmi more than 55. I checked the weight and height values for the corresponding subjects, and the BMI was calculated correctly. Values around 55 might affect model performance.
+
+**Age at the assesment day:** No outliers were detected.
+
+**Physical activity:** 3 boxplot outliers, but they are theoretically plausible values.
+
+**CIMT left average:** All boxplot outliers are biologically plausible.
+
+**CIMT right average:** All boxplot outliers are biologically plausible.
+
+**Glucose at 2h after glucose load:** 1 outlier (\~22.5 mmol/l) that might significantly affect model performance. Replace to the closest highest value.
+
+**Total cholesterol:** All boxplot outliers are biologically plausible.
+
+**Fasted glucose**: All boxplot outliers are biologically plausible. Extremelly high values might be due to the food consumption before the test.
+
+**All outliers will be examined after performing regression to address only true outliers and influential observations.**
+
+# Imputation
+
+## Investigation of missingness
+
+First, investigate the overall missingness in the dataset.
+
+```{r}
+c66_project_df_fil_1 <- c66_project_df
+###### Save the final dataset with labels ######
+# Define the specific file path 
+file_path <- "//kaappi.oulu.fi/nfbc$/projects/P0511/Alex/1_c66_project_df.rds"
+
+# Save
+saveRDS(c66_project_df, file_path)
+
+# Load
+my_data <- readRDS(file_path)
+
+# Get the number of missing values per variable
+c66_project_df_fil_1 %>%
+	is.na() %>% 
+	colSums()
+
+# Visualize the missing values with clustering
+vis_miss(c66_project_df_fil_1, cluster = TRUE)
+
+#Missing data summary
+miss_var_summary(c66_project_df_fil_1)
+```
+
+Based on the summary, it seems that the the majority of the variables with missing values are related to the questions from the questionnaire, 2h glucose and CIMT.
+
+Next, assess the missingness pattern - is missing data missing completely at random (MCAR), missing at random (MAR), or missing not at random (MNAR).
+
+```{r}
+#| warning: false
+# Draw an aggregation plot
+c66_project_df_fil_1 %>% 
+	aggr(combined = TRUE, numbers = TRUE, cex.axis = 0.4, only.miss = TRUE)
+
+#There are many combinations of variables that are often missing together, which suggests MAR, especially for questions about diabetes and hypertenstion.
+#The missingness of CIMT variables probably MAR because we see cross limiting extreme values in the statistical data to reduce the effect of possibly spurious outliers limiting extreme values in the statistical data to reduce the effect of possibly spurious outliers limiting extreme values in the statistical data to reduce the effect of possibly spurious outliers limiting extreme values in the statistical data to reduce the effect of possibly spurious outliers missingness with many variables.
+
+# The missingness pattern
+gg_miss_upset(c66_project_df_fil_1) 
+
+#patterns
+md.pattern(c66_project_df_fil_1[,-1], rotate.names = TRUE)
+#
+
+#outflux and influx
+fx <- fluxplot(c66_project_df_fil_1)
+```
+
+Variables with higher outflux are (potentially) the more powerful predictors. Variables with higher influx depend stronger on the imputation model. When points are relatively close to the diagonal, it indicates that influx and outflux are balanced.
+
+The variables in the upper left corner have the more complete information, so the number of missing data problems for this group is relatively small. These variables are stable and don’t rely much on imputation.
+
+The variables in the middle have an outflux between 0.7 and 0.8, which is not high. Missing data problems are thus more severe, but potentially this group could also contain important variables.
+
+The lower (bottom) variables have an outflux with 0.05 or lower, so their predictive power is limited. Also, this group has a higher influx, and, thus, depend more highly on the imputation model.
+
+Variables `c66_46_chol`, `c66_46_glc`, `c66_46_c_bmi`, `c66_46_hpcl` , `c66_46_avrsybp` , `c66_46_avrdibp` , `c66_46_ht_comb`, `c66_46_c_ht` will not be analyzed for the type of missingness due to the extremely small percentage of missing values. The imputing these variables will cause an negligibly small bias, if any.
+
+```{r}
+# Include only factor variables
+other_vars = names(c66_project_df_fil_1)[sapply(c66_project_df_fil_1, is.factor)]
+
+# Loop through all variables except 'height' and create plots
+
+for (var in other_vars) {
+  print(
+    gg_miss_fct(c66_project_df_fil_1, fct = !!sym(var))
+  )
+}
+```
+
+We can see that variables missingness is differently distributed between categories.
+
+The dependency is presented in the plot below:
+
+```{r}
+# Example data: categories and variables
+categories <- c(
+  "Question about type 1 diabetes",
+  "Question about type 2 diabetes",
+  "Question about hypertension",
+  "Hypertension based on clinical measurements",
+  "Taking antihypertensive medications",
+  "Education",
+  "Smoking",
+  "Alcohol intake",
+  "Occupation status",
+  "Sex",
+  "Diabetes",
+  "Hypercholesterolemia",
+  "Hypertension (combined)",
+  "Season at clinical measurement"
+)
+
+
+variables <- list(
+  #Question about type 1 diabetes: 
+  c("c66_46_cimt_l_avg", "c66_46_cimt_r_avg", "c66_46_gluc2h", "c66_46_occup", "c66_46_q1_dbt2", "c66_46_smok", "day_mean", "y1_sd_temp", "y1_avg_temp", "y1_app_temp_avg_46", "y1_app_temp_sd_46"),
+  #Question about type 2 diabetes: 
+  c( "c66_46_alc", "c66_46_edu", "c66_46_gluc2h", "c66_46_ht_med", "c66_46_occup", "c66_46_phys", "c66_46_q1_dbt1", "c66_46_smok", "day_mean"),
+  #Question about hypertension:  
+  c( "c66_46_gluc2h", "c66_46_occup", "c66_46_q1_dbt1", "c66_46_q1_dbt2", "day_mean"),
+  #Hypertension based on clinical measurements: 
+  c("c66_46_occup", "c66_46_phys", "c66_46_q1_dbt1", "c66_46_q1_ht", "day_mean"),
+  #Taking antihypertensive medications: 
+  c("c66_46_gluc2h", "c66_46_occup", "c66_46_phys", "day_mean"),
+  #Education:  
+  c( "c66_46_cimt_l_avg", "c66_46_cimt_r_avg", "c66_46_occup", "c66_46_phys", "c66_46_q1_dbt2", "c66_46_smok", "day_mean", "y1_sd_temp", "y1_avg_temp", "y1_app_temp_avg_46", "y1_app_temp_sd_46"),
+  #Smoking:  
+  c( "c66_46_cimt_l_avg", "c66_46_cimt_r_avg", "c66_46_gluc2h", "c66_46_occup", "c66_46_phys", "c66_46_q1_dbt2", "day_mean", "y1_sd_temp", "y1_avg_temp", "y1_app_temp_avg_46", "y1_app_temp_sd_46"),
+  #Alcohol intake: 
+  c( "c66_46_gluc2h", "c66_46_occup", "c66_46_phys", "day_mean"),
+  #Occupation status:  
+  c( "c66_46_alc", "c66_46_c_bmi", "c66_46_cimt_l_avg", "c66_46_cimt_r_avg", "c66_46_edu", "c66_46_gluc2h", "c66_46_ht_med", "c66_46_phys", "c66_46_q1_dbt1", "c66_46_q1_dbt2", "c66_46_q1_ht", "c66_46_smok", "day_mean", "y1_sd_temp", "y1_avg_temp", "y1_app_temp_avg_46", "y1_app_temp_sd_46"),
+  #Sex:  
+  c( "c66_46_alc", "c66_46_edu", "c66_46_gluc2h", "c66_46_ht_med", "c66_46_occup", "c66_46_phys", "c66_46_q1_dbt1", "c66_46_q1_dbt2", "c66_46_q1_ht", "c66_46_smok", "day_mean"),
+  #Diabetes:  
+  c( "c66_46_alc", "c66_46_edu", "c66_46_gluc2h", "c66_46_ht_med", "c66_46_occup", "c66_46_phys", "c66_46_q1_dbt1", "c66_46_q1_dbt2", "c66_46_smok", "y1_sd_temp", "y1_avg_temp", "y1_app_temp_avg_46", "y1_app_temp_sd_46"),
+  #Hypercholesterolemia: 
+  c("c66_46_gluc2h", "c66_46_occup", "c66_46_phys", "c66_46_smok"),
+  #Hypertension(combined): 
+  c("c66_46_alc", "c66_46_edu", "c66_46_gluc2h", "c66_46_ht_med", "c66_46_phys", "c66_46_q1_dbt1", "c66_46_q1_dbt2", "c66_46_q1_ht", "c66_46_smok", "day_mean"),
+  #Season at clinical measurement: 
+  c("c66_46_cimt_l_avg", "c66_46_cimt_r_avg", "c66_46_gluc2h", "c66_46_ht_med", "c66_46_occup", "c66_46_phys", "c66_46_q1_dbt2", "c66_46_q1_ht", "day_mean", "c66_46_edu", "c66_46_q1_dbt1","y1_sd_temp", "y1_avg_temp", "y1_app_temp_avg_46", "y1_app_temp_sd_46")
+)
+
+# All unique variables
+unique_variables <- unique(unlist(variables))
+
+# Create a binary matrix
+binary_matrix <- as.data.frame(matrix(0, nrow = length(unique_variables), ncol = length(categories)))
+rownames(binary_matrix) <- unique_variables
+colnames(binary_matrix) <- categories
+
+# Fill the matrix with 1 where variables are present
+for (i in seq_along(categories)) {
+  binary_matrix[variables[[i]], categories[i]] <- 1
+}
+
+# Add rownames (variable names) as a column
+binary_matrix$Variable <- rownames(binary_matrix)
+
+# Convert the matrix to a long format for ggplot2
+binary_matrix_long <- melt(binary_matrix, id.vars = "Variable", variable.name = "Category", value.name = "Presence")
+
+# Plot the heatmap
+ggplot(binary_matrix_long, aes(x = Category, y = Variable, fill = as.factor(Presence))) +
+  geom_tile(color = "white") +
+  scale_fill_manual(values = c("0" = "lightgray", "1" = "steelblue"), labels = c("Absent", "Present")) +
+  labs(title = "Different distribution of NAs Across Categories", x = "Category", y = "Variable", fill = "Presence") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Based on the plot we can assume that all variables with missing values are MAR because the missingness for each separate predictor depends on other variables in the dataset.
+
+## Multivariate imputation by chained equations (MICE)
+
+Two methods will be compared regarding imputation performance: random forest (machine learning algorithm effectively dealing with non-linear and categorical data) and predicitive mean matching (imputed values are always inside the range of true values) for continuous variables.
+
+### Random forest:
+
+Random forest will be applied to the all types of variables.
+
+```{r}
+#| eval: false
+#| include: false
+# Impute project dataset with mice using 5 imputations 
+#More imputed dataset will be used after finalizing model setup:
+#fraction of information about the coefficients missing due to nonresponse (fmi) 
+#the proportion of the variation attributable to the missing data (lambda)
+
+proj_multiimp <- futuremice(c66_project_df_fil_1, 
+                            m = 20, maxit = 30, 
+                            parallelseed = 2025, 
+                            defaultMethod = c("rf", "rf", "rf", "rf"),
+                            print = F)
+
+# Print summary of the model
+print(proj_multiimp) 
+
+#density plot to evalute quality of imputation
+densityplot(proj_multiimp)
+
+tail(proj_multiimp$loggedEvents)
+```
+
+#### Convergence
+
+Check the convergence for all imputed variables:
+
+```{r}
+#| eval: false
+#| include: false
+set.seed(2025)
+# Identify variables with missing values
+other_vars <- names(c66_project_df_fil_1)[colSums(is.na(c66_project_df_fil_1)) > 0]
+
+# Loop through all variables with missing values
+for (var in other_vars) {
+  # Generate the convergence plot
+  plot_obj <- plot(proj_multiimp, y = var)
+  
+  # Create a text grob with the variable name
+  title <- grid::textGrob(paste("Convergence of", var), gp = grid::gpar(fontsize = 14, fontface = "bold"))
+  
+  # Combine the title and plot
+  gridExtra::grid.arrange(title, plot_obj, ncol = 1, heights = c(0.2, 1))
+}
+```
+
+Poor convergence was found for `c66_46_c_ht`, `c66_46_hpcl`, `c66_46_ht_comb`, because these variables are constructed based on other variables, and the transformations are not reflected by imputation. That means we should apply passive imputation to these variables. The goal of passive imputation is to maintain the consistency among different transformations of the same data.
+
+However, the aforementioned categorical variables will not be passively imputed due to the low overall missingness and, therefore, low importance. To increase their convergence just the origin variables will be excluded from imputation table.
+
+Set up prediction matrix in order to avoid circularity and increase convergence:
+
+```{r}
+#| eval: false
+#| warning: false
+#| include: false
+# 1) First run mice with maxit=0 to get the initial predictor matrix
+proj_multiimp <- futuremice(
+  c66_project_df_fil_1, 
+  maxit = 0, 
+  parallelseed = 2025, 
+  defaultMethod = c("rf", "rf", "rf", "rf"),
+  print = FALSE
+)
+
+# 2) Extract the predictor matrix
+pred <- proj_multiimp$pred
+
+# -- PART A: Set combined variables as zero predictors for variables that were used to create them in order to avoid circularity
+pred[c("c66_46_avrsybp", "c66_46_avrdibp"), 
+     "c66_46_c_ht"] <- 0
+
+pred[c("c66_46_avrsybp", "c66_46_avrdibp", "c66_46_c_ht", 
+       "c66_46_q1_ht", "c66_46_ht_med"), 
+     "c66_46_ht_comb"] <- 0
+
+pred["c66_46_chol", "c66_46_hpcl"] <- 0
+
+pred[c("c66_46_glc","c66_46_gluc2h", "c66_46_q1_dbt1", "c66_46_q1_dbt2"),
+     "c66_46_diab"] <- 0
+
+pred[c("c66_46_season"), "c66_46_season_c_w"] <- 0
+
+pred["c66_46_c_bmi" ,"c66_46_c_bmi_cat"] <- 0
+
+#passive imputation of the bmi_categorical variable
+meth = proj_multiimp$method
+
+meth["c66_46_season_c_w"] <- "~I(
+  factor(
+    ifelse(
+      c66_46_season == 'Winter' | c66_46_season == 'Spring',
+      'Cold',
+      'Warm'
+    ),
+    levels = c('Cold', 'Warm')
+  )
+)"
+
+meth["c66_46_c_ht"] <- "~I(
+  factor(
+    ifelse(
+      c66_46_avrsybp >= 140 | c66_46_avrdibp >= 90,
+      'Yes',
+      'No'
+    ),
+    levels = c('No', 'Yes')
+  )
+)"
+
+meth["c66_46_c_bmi_cat"] <- "~I(
+  factor(
+    ifelse(c66_46_c_bmi < 30, 'Nonobese', 'Obese'), 
+    levels = c('Nonobese', 'Obese')
+  )
+)"
+
+meth["c66_46_diab"] <- "~I(
+  factor(
+    ifelse(
+      c66_46_gluc2h >= 11.1 | 
+      (c66_46_q1_dbt1 == 'Yes' | c66_46_q1_dbt2 == 'Yes') | 
+      c66_46_glc >= 7.0,
+      'Yes',
+      'No'
+    ),
+    levels = c('No', 'Yes')
+  )
+)"
+
+
+meth["c66_46_ht_comb"] <- "~I(
+  factor(
+    ifelse(c66_46_ht_med == 'Yes' | c66_46_q1_ht == 'Yes' | c66_46_c_ht == 'Yes', 
+           'Yes', 
+           'No'),
+    levels = c('No', 'Yes')
+  )
+)"
+
+
+meth["c66_46_hpcl"] <- "~I(
+  factor(
+    ifelse(c66_46_chol >= 6.216, 'Yes', 'No'),
+    levels = c('No','Yes')
+  )
+)"
+
+
+# -- PART B: Impute y1_app_temp_avg_46 from original climate variables (no reference to app_temp_sd_46)
+#set 0 variables as predictors for apparent temp. variables
+pred["y1_app_temp_avg_46", ] <- 0
+pred["y1_app_temp_sd_46", ] <- 0
+
+#dont use apparent as predictor due to high correl(>0.9) with avg.temp and temp.sd
+pred[ ,"y1_app_temp_avg_46"] <- 0
+pred[ ,"y1_app_temp_sd_46"] <- 0
+
+#dont use CIMT as predictor to high missingness(>50%)
+pred[ ,"c66_46_cimt_l_avg"] <- 0
+pred[ ,"c66_46_cimt_r_avg"] <- 0
+
+pred["y1_app_temp_avg_46", 
+     c("y1_avg_temp", "y1_avg_rh", "y1_avg_ws", 
+       "y1_sd_temp", "y1_sd_rh", "y1_sd_ws")] <- 1
+
+# Exclude y1_app_temp_avg_46 from predicting those climate variables
+pred[c("y1_avg_temp", "y1_avg_rh", "y1_avg_ws",
+       "y1_sd_temp", "y1_sd_rh", "y1_sd_ws"), 
+     "y1_app_temp_avg_46"] <- 0
+
+# -- PART C: Impute y1_app_temp_sd_46 from original climate vars (no reference to app_temp_avg_46)
+pred["y1_app_temp_sd_46", 
+     c("y1_sd_temp", "y1_sd_rh", "y1_sd_ws", 
+       "y1_avg_temp", "y1_avg_rh", "y1_avg_ws")] <- 1
+
+# Exclude y1_app_temp_sd_46 from predicting those original variables
+pred[c("y1_sd_temp", "y1_sd_rh", "y1_sd_ws",
+       "y1_avg_temp", "y1_avg_rh", "y1_avg_ws"),
+     "y1_app_temp_sd_46"] <- 0
+
+# -- PART D: Explicitly set no cross-prediction between y1_app_temp_avg_46 and y1_app_temp_sd_46
+pred["y1_app_temp_avg_46", "y1_app_temp_sd_46"] <- 0
+pred["y1_app_temp_sd_46", "y1_app_temp_avg_46"] <- 0
+
+# 3) Check the final predictor matrix if you wish
+pred
+
+# 4) Run the actual imputation with maxit=10
+proj_multiimp <- futuremice(
+  c66_project_df_fil_1, 
+  pred = pred, 
+  m = 20, 
+  maxit = 30, 
+  parallelseed = 2025, 
+  defaultMethod = c("rf", "rf", "rf", "rf"),
+  print = FALSE
+)
+```
+
+Recheck convergence:
+
+```{r}
+#| eval: false
+#| include: false
+set.seed(2025)
+# Identify variables with missing values
+other_vars <- names(c66_project_df_fil_1)[colSums(is.na(c66_project_df_fil_1)) > 0]
+
+# Loop through all variables with missing values
+for (var in other_vars) {
+  # Generate the convergence plot
+  plot_obj <- plot(proj_multiimp, y = var)
+  
+  # Create a text grob with the variable name
+  title <- grid::textGrob(paste("Convergence of", var), gp = grid::gpar(fontsize = 14, fontface = "bold"))
+  
+  # Combine the title and plot
+  gridExtra::grid.arrange(title, plot_obj, ncol = 1, heights = c(0.2, 1))
+}
+```
+
+Convergence has improved for all involved variables.
+
+#### Filtering our rows with imputed outcome and exposure values
+
+##### BP dataset
+
+After performing imputation we delete rows with imputed BP outcome values and exposure + delete CIMT outcome variables:
+
+```{r}
+#| eval: false
+#| include: false
+# Convert the mids object to long format and include the original data (.imp == 0)
+long_data <- complete(proj_multiimp, "long", include = TRUE)
+
+# Identify rows in the original data (.imp == 0) with missing outcome or exposure
+missing_rows <- long_data %>%
+  filter(.imp == 0 & (is.na(c66_46_avrsybp) | is.na(y1_avg_temp))) %>%
+  pull(.id)  # Extract the .id values of these rows
+
+# Filter out these rows from all imputations
+filtered_data <- long_data %>%
+  filter(!(.id %in% missing_rows))%>%
+  select(-c66_46_cimt_l_avg, -c66_46_cimt_r_avg)
+
+# Convert the filtered data back to a mids object
+proj_multiimp <- as.mids(filtered_data)
+
+summary(complete(proj_multiimp))
+```
+
+##### CIMT dataset
+
+Create a new object for the CIMT outcome. Due to the fact, that people were chosen randomly for the CIMT measurement (each first, third, fifth,and seventh subject of the day), this separation will not bias future analysis, only decrease the sample size.
+
+```{r}
+#| eval: false
+#| include: false
+#Filter rows where `c66_46_cimt_r_avg` and "c66_46_cimt_l_avg" was missing in the original data for all datasets = exclude rows with missing outcome and exposure + delete BP outcome variables
+# Identify rows in the original data (.imp == 0) with missing outcome or exposure
+missing_rows <- long_data %>%
+  filter(.imp == 0 & (is.na(c66_46_cimt_r_avg) | is.na(c66_46_cimt_l_avg) | is.na(y1_avg_temp))) %>%
+  pull(.id)  # Extract the .id values of these rows
+
+# Filter out these rows from all imputations
+filtered_data <- long_data %>%
+  filter(!(.id %in% missing_rows))%>%
+  select(-c66_46_avrsybp, -c66_46_avrdibp)
+
+# Convert the filtered data back to a mids object
+proj_multiimp_cimt <- as.mids(filtered_data)
+
+summary(complete(proj_multiimp_cimt))
+```
+
+#### Mean comparison between imputed and non-imputed datasets
+
+Next compare means between different imputed datasets.
+
+First create a dataframe with comparison of means of imputed vs non-imputed dataframes.
+
+##### BP dataset
+
+```{r}
+#| eval: false
+#| warning: false
+#| include: false
+# Initialize an empty list to collect results
+results_list <- list()
+# Get numeric variable names
+other_vars <- names(c66_project_df_fil_1)[sapply(c66_project_df_fil_1, is.numeric)]
+# Exclude the variables that were imputed but the observations were deleted
+other_vars <- setdiff(other_vars, c("c66_46_cimt_l_avg", "c66_46_cimt_r_avg", "y1_avg_temp", 
+                                    "c66_46_avrsybp", "c66_46_avrdibp", "y1_avg_temp", "y1_sd_temp", 
+                                    "y1_app_temp_avg_46", "y1_app_temp_sd_46", "y1_avg_rh",
+                                    "y1_avg_ws", "y1_sd_rh", "y1_sd_ws"))  
+
+# Loop through numeric variables
+for (var in other_vars) {
+  # Compute the means for all imputations
+  imputed_means <- with(proj_multiimp, mean(get(var)))$analyses
+  
+  # Compute the mean from the original non-imputed dataset
+  original_mean <- mean(c66_project_df_fil_1[[var]], na.rm = TRUE)
+  
+  # Combine the results for this variable: original + imputed
+  variable_means <- c(original_mean, unlist(imputed_means))
+  
+  # Store the results in the list with the variable name
+  results_list[[var]] <- variable_means
+}
+
+# Combine all variables into a single dataframe
+results_df <- sapply(results_list, cbind)
+
+# Add row names to indicate imputations and non-imputed
+rownames(results_df) <- c("Non-imputed", paste0("Imputation_", seq_len(nrow(results_df) - 1)))
+
+# Convert to a tibble for better display
+results_df <- as.data.frame(results_df)
+
+# Print the resulting dataframe
+results_df
+```
+
+Calculate bias between original (non-imputed) mean and imputed means:
+
+```{r}
+#| eval: false
+#| include: false
+
+# Loop through numeric variables
+for (var in other_vars) {
+  # Add a section title for each variable
+  cat("\n### Summary and Bias for variable:", var, "\n\n")
+  
+  # Compute the mean for imputed datasets
+  imputed_means <- with(proj_multiimp, mean(get(var)))$analyses
+  
+  # Average the means across imputations
+  imputed_mean <- mean(unlist(imputed_means))
+  
+  # Compute the mean from the original non-imputed dataset
+  original_mean <- mean(c66_project_df_fil_1[[var]], na.rm = TRUE)
+  
+  # Calculate the bias
+  bias <- imputed_mean - original_mean
+  
+  # Print the results
+  cat("Original mean (non-imputed):", original_mean, "\n")
+  cat("Imputed mean (average across imputations):", imputed_mean, "\n")
+  cat("Bias (Imputed - Original):", bias, "\n\n")
+}
+```
+
+The means match almost perfectly for all variables.
+
+##### CIMT dataset:
+
+```{r}
+#| eval: false
+#| warning: false
+#| include: false
+# Initialize an empty list to collect results
+results_list <- list()
+# Get numeric variable names
+# Get numeric variable names
+other_vars <- names(c66_project_df_fil_1)[sapply(c66_project_df_fil_1, is.numeric)]
+# Exclude the variables that were imputed but the observations were deleted
+other_vars <- setdiff(other_vars, c("c66_46_cimt_l_avg", "c66_46_cimt_r_avg", "y1_avg_temp", 
+                                    "c66_46_avrsybp", "c66_46_avrdibp", "y1_avg_temp", "y1_sd_temp", 
+                                    "y1_app_temp_avg_46", "y1_app_temp_sd_46", "y1_avg_rh",
+                                    "y1_avg_ws", "y1_sd_rh", "y1_sd_ws")) 
+
+# Loop through numeric variables
+for (var in other_vars) {
+  # Compute the means for all imputations
+  imputed_means <- with(proj_multiimp_cimt, mean(get(var)))$analyses
+  
+  # Compute the mean from the original non-imputed dataset
+  original_mean <- mean(c66_project_df_fil_1[[var]], na.rm = TRUE)
+  
+  # Combine the results for this variable: original + imputed
+  variable_means <- c(original_mean, unlist(imputed_means))
+  
+  # Store the results in the list with the variable name
+  results_list[[var]] <- variable_means
+}
+
+# Combine all variables into a single dataframe
+results_df <- sapply(results_list, cbind)
+
+# Add row names to indicate imputations and non-imputed
+rownames(results_df) <- c("Non-imputed", paste0("Imputation_", seq_len(nrow(results_df) - 1)))
+
+# Convert to a tibble for better display
+results_df <- as.data.frame(results_df)
+
+# Print the resulting dataframe
+results_df
+```
+
+Calculate bias:\
+
+```{r}
+#| eval: false
+#| include: false
+
+# Loop through numeric variables
+for (var in other_vars) {
+  # Add a section title for each variable
+  cat("\n### Summary and Bias for variable:", var, "\n\n")
+  
+  # Compute the mean for imputed datasets
+  imputed_means <- with(proj_multiimp_cimt, mean(get(var)))$analyses
+  
+  # Average the means across imputations
+  imputed_mean <- mean(unlist(imputed_means))
+  
+  # Compute the mean from the original non-imputed dataset
+  original_mean <- mean(c66_project_df_fil_1[[var]], na.rm = TRUE)
+  
+  # Calculate the bias
+  bias <- imputed_mean - original_mean
+  
+  # Print the results
+  cat("Original mean (non-imputed):", original_mean, "\n")
+  cat("Imputed mean (average across imputations):", imputed_mean, "\n")
+  cat("Bias (Imputed - Original):", bias, "\n\n")
+}
+```
+
+There are some differences in means but they are not crucial. The biggest differences in means are in the second decimals numbers.
+
+#### Imputation diagnostic
+
+Next, we assess the imputation performance.
+
+Good imputations have a distribution similar to the observed data. In other words, the imputations could have been real values had they been observed.
+
+Under MCAR, univariate distributions of the observed and imputed data are expected to be identical. Under MAR, they can be different, both in location and spread, but their multivariate distribution is assumed to be identical. 
+
+##### BP dataset check
+
+```{r}
+#| eval: false
+#| include: false
+#Box-plots of observed vs imputed datasets
+bwplot(proj_multiimp, c66_46_c_bmi ~ .imp)
+bwplot(proj_multiimp, c66_46_gluc2h ~ .imp)
+bwplot(proj_multiimp, c66_46_phys ~ .imp)
+bwplot(proj_multiimp, c66_46_ap_age ~ .imp)
+bwplot(proj_multiimp, c66_46_chol ~ .imp)
+bwplot(proj_multiimp, c66_46_glc ~ .imp)
+bwplot(proj_multiimp, day_mean ~ .imp)
+
+
+#Stripplots for imputed numeric variables
+stripplot(proj_multiimp, c66_46_c_bmi ~ .imp,
+          col = c("gray", "black"),
+          pch = c(21, 20),
+          cex = c(1, 1.5))
+
+stripplot(proj_multiimp, c66_46_gluc2h ~ .imp,
+          col = c("gray", "black"),
+          pch = c(21, 20),
+          cex = c(1, 1.5))
+
+stripplot(proj_multiimp, c66_46_phys ~ .imp,
+          col = c("gray", "black"),
+          pch = c(21, 20),
+          cex = c(1, 1.5))
+
+stripplot(proj_multiimp, c66_46_ap_age ~ .imp,
+          col = c("gray", "black"),
+          pch = c(21, 20),
+          cex = c(1, 1.5))
+
+stripplot(proj_multiimp, c66_46_chol ~ .imp,
+          col = c("gray", "black"),
+          pch = c(21, 20),
+          cex = c(1, 1.5))
+
+stripplot(proj_multiimp, c66_46_glc ~ .imp,
+          col = c("gray", "black"),
+          pch = c(21, 20),
+          cex = c(1, 1.5))
+
+stripplot(proj_multiimp, day_mean ~ .imp,
+          col = c("gray", "black"),
+          pch = c(21, 20),
+          cex = c(1, 1.5))
+
+```
+
+Age at the assesment day does not have imputed values - \> will not be included in the future imputation analysis.
+
+There are significant differences in `BMI` and `chol` variables and some extremely unrealistic outlier value, which are a serious issue. This might indicate MAR or MNAR data or poor imputations by random forest (imputation out of observed data). Also, the reason could be a very small amount of imputed datapoints (only 6 for bmi and cholesterol) - the most likely reason. `Day_mean` also contains some imputed outlier values.
+
+Next, compare the distributions of observed data and imputed data. Under MCAR the distributions should be similar, but under MAR they can vary.
+
+```{r}
+#| eval: false
+#| include: false
+densityplot(proj_multiimp)
+```
+
+The random forest captures the observed values well ​​on average, but there are some discrepancies for BMI and cholesterol, which might indicate MAR,MNAR, poor imputation.
+
+To compare the distributions of observed and imputed data under MAR we should condition on the missingness probability. The idea is that under MAR the conditional distributions should be similar if the assumed model for creating multiple imputations has a good fit. 
+
+```{r}
+#| eval: false
+#| include: false
+#model the probability of each record being incomplete as a function of all variables in each imputed dataset
+fit <- with(proj_multiimp, glm(ici(proj_multiimp) ~ c66_46_q1_dbt1 + c66_46_q1_dbt2 + c66_46_q1_ht + c66_46_c_ht+ c66_46_avrsybp +
+                                 c66_46_avrdibp + c66_46_c_bmi + c66_46_gluc2h + c66_46_ht_med + c66_46_edu + c66_46_ht_med + 
+                                 c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup + c66_46_ap_age + sex +
+                                 c66_46_chol + c66_46_glc + c66_46_diab + c66_46_hpcl + c66_46_ht_comb + c66_46_season+
+                                 day_mean + y1_avg_temp + y1_sd_temp + y1_app_temp_avg_46 + y1_app_temp_sd_46 + y1_avg_rh +
+                                 y1_avg_ws + y1_sd_rh + y1_sd_ws,
+                     family = binomial))
+
+#The probabilities (propensities) are then averaged over the imputed datasets to obtain stability
+ps <- rep(rowMeans(sapply(fit$analyses, fitted.values)),
+          proj_multiimp$m + 1)
+
+#Plot variables against the propensity score in each dataset
+xyplot(proj_multiimp, c66_46_c_bmi ~ ps | as.factor(.imp),
+       xlab = "Probability that record is incomplete",
+       ylab = "BMI", pch = c(1, 19), col = mdc(1:2))
+
+xyplot(proj_multiimp, c66_46_gluc2h ~ ps | as.factor(.imp),
+       xlab = "Probability that record is incomplete",
+       ylab = "gluc2h", pch = c(1, 19), col = mdc(1:2))
+
+xyplot(proj_multiimp, c66_46_phys ~ ps | as.factor(.imp),
+       xlab = "Probability that record is incomplete",
+       ylab = "phys act", pch = c(1, 19), col = mdc(1:2))
+
+xyplot(proj_multiimp, c66_46_chol ~ ps | as.factor(.imp),
+       xlab = "Probability that record is incomplete",
+       ylab = "chol lvl", pch = c(1, 19), col = mdc(1:2))
+
+xyplot(proj_multiimp, c66_46_glc ~ ps | as.factor(.imp),
+       xlab = "Probability that record is incomplete",
+       ylab = "glc lvl", pch = c(1, 19), col = mdc(1:2))
+
+xyplot(proj_multiimp, day_mean ~ ps | as.factor(.imp),
+       xlab = "Probability that record is incomplete",
+       ylab = "day_mean", pch = c(1, 19), col = mdc(1:2))
+```
+
+Imputed data points of `day_mean` are somewhat shifted to the right, for `gluc2h` to the right and down. Other variables do not have a substantial shift, but outlier values. Overall, the distributions of the blue and red points are quite similar, as expected under MAR.
+
+Imputation for categorical variables:
+
+```{r}
+#| eval: false
+#| include: false
+# Include only factor variables
+other_vars = names(c66_project_df_fil_1)[sapply(c66_project_df_fil_1, is.factor)]
+
+imp.dat <- complete(proj_multiimp, "long", include = TRUE)
+
+#create a new factor variable, that indicates imputed observations
+imp.dat <- imp.dat %>% 
+  mutate(imputed = .imp > 0,
+         imputed = factor(imputed,
+                          levels = c(F,T),
+                          labels = c("Observed", "Imputed")))
+
+# Loop through all factor
+for (v in other_vars) {
+  #print a name of the variable
+  print(v)
+  
+  # Create the proportion table
+  tb <- prop.table(table(imp.dat[[v]], imp.dat$imputed), margin = 2)
+  
+  # Round the proportion table to 3 decimal places
+  tb_rounded <- round(tb, 3)
+  
+  # Print the rounded table
+  print(tb_rounded)
+}
+```
+
+In average, imputed categorical values are identical to observed ones, which indicates good imputation quality.
+
+##### CIMT dataset
+
+Repeat the same workflow with filtered CIMT dataset:
+
+```{r}
+#| eval: false
+#| include: false
+#Box-plots of observed vs imputed datasets
+bwplot(proj_multiimp_cimt, c66_46_c_bmi ~ .imp)
+bwplot(proj_multiimp_cimt, c66_46_gluc2h ~ .imp)
+bwplot(proj_multiimp_cimt, c66_46_phys ~ .imp)
+bwplot(proj_multiimp_cimt, c66_46_chol ~ .imp)
+bwplot(proj_multiimp_cimt, c66_46_glc ~ .imp)
+bwplot(proj_multiimp_cimt, day_mean ~ .imp)
+
+
+#Stripplots for imputed numeric variables
+stripplot(proj_multiimp_cimt, c66_46_c_bmi ~ .imp,
+          col = c("gray", "black"),
+          pch = c(21, 20),
+          cex = c(1, 1.5))
+
+stripplot(proj_multiimp_cimt, c66_46_gluc2h ~ .imp,
+          col = c("gray", "black"),
+          pch = c(21, 20),
+          cex = c(1, 1.5))
+
+stripplot(proj_multiimp_cimt, c66_46_phys ~ .imp,
+          col = c("gray", "black"),
+          pch = c(21, 20),
+          cex = c(1, 1.5))
+
+stripplot(proj_multiimp_cimt, c66_46_chol ~ .imp,
+          col = c("gray", "black"),
+          pch = c(21, 20),
+          cex = c(1, 1.5))
+
+stripplot(proj_multiimp_cimt, c66_46_glc ~ .imp,
+          col = c("gray", "black"),
+          pch = c(21, 20),
+          cex = c(1, 1.5))
+
+stripplot(proj_multiimp_cimt, day_mean ~ .imp,
+          col = c("gray", "black"),
+          pch = c(21, 20),
+          cex = c(1, 1.5))
+```
+
+Only 1 imputed value for bmi and cholesterol, 2 imputed values for glucose. Other imputed variables look similar to observed data.
+
+Density plots:
+
+```{r}
+#| eval: false
+#| include: false
+densityplot(proj_multiimp_cimt)
+```
+
+Distributions look identical which implies MCAR and good imputation model.
+
+Conditional plots:
+
+```{r}
+#| eval: false
+#| include: false
+#model the probability of each record being incomplete as a function of all variables in each imputed dataset
+fit <- with(proj_multiimp_cimt, glm(ici(proj_multiimp_cimt) ~ c66_46_q1_dbt1 + c66_46_q1_dbt2 + c66_46_q1_ht + c66_46_c_ht+
+                                      c66_46_cimt_l_avg + c66_46_cimt_r_avg + c66_46_c_bmi + c66_46_gluc2h + c66_46_ht_med + 
+                                      c66_46_edu + c66_46_ht_med + 
+                                      c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup + c66_46_ap_age + sex +
+                                      c66_46_chol + c66_46_glc + c66_46_diab + c66_46_hpcl + c66_46_ht_comb + c66_46_season+
+                                      day_mean + y1_avg_temp + y1_sd_temp + y1_app_temp_avg_46 + y1_app_temp_sd_46 + y1_avg_rh+
+                                      y1_avg_ws + y1_sd_rh + y1_sd_ws,
+                     family = binomial))
+
+#The probabilities (propensities) are then averaged over the imputed datasets to obtain stability
+ps <- rep(rowMeans(sapply(fit$analyses, fitted.values)),
+          proj_multiimp_cimt$m + 1)
+
+#Plot variables against the propensity score in each dataset
+xyplot(proj_multiimp_cimt, c66_46_c_bmi ~ ps | as.factor(.imp),
+       xlab = "Probability that record is incomplete",
+       ylab = "BMI", pch = c(1, 19), col = mdc(1:2))
+
+xyplot(proj_multiimp_cimt, c66_46_gluc2h ~ ps | as.factor(.imp),
+       xlab = "Probability that record is incomplete",
+       ylab = "gluc2h", pch = c(1, 19), col = mdc(1:2))
+
+xyplot(proj_multiimp_cimt, c66_46_phys ~ ps | as.factor(.imp),
+       xlab = "Probability that record is incomplete",
+       ylab = "phys act", pch = c(1, 19), col = mdc(1:2))
+
+xyplot(proj_multiimp_cimt, c66_46_chol ~ ps | as.factor(.imp),
+       xlab = "Probability that record is incomplete",
+       ylab = "chol lvl", pch = c(1, 19), col = mdc(1:2))
+
+xyplot(proj_multiimp_cimt, c66_46_glc ~ ps | as.factor(.imp),
+       xlab = "Probability that record is incomplete",
+       ylab = "glc lvl", pch = c(1, 19), col = mdc(1:2))
+
+xyplot(proj_multiimp_cimt, day_mean ~ ps | as.factor(.imp),
+       xlab = "Probability that record is incomplete",
+       ylab = "day_mean", pch = c(1, 19), col = mdc(1:2))
+```
+
+Imputed values of day_mean are shifted to the right. Overall, the distributions of the blue and red points are quite similar, as expected under MAR.
+
+Factor variables check:
+
+```{r}
+#| eval: false
+#| include: false
+# Include only factor variables
+other_vars = names(c66_project_df_fil_1)[sapply(c66_project_df_fil_1, is.factor)]
+
+imp.dat <- complete(proj_multiimp_cimt, "long", include = TRUE)
+
+#create a new factor variable, that indicates imputed observations
+imp.dat <- imp.dat %>% 
+  mutate(imputed = .imp > 0,
+         imputed = factor(imputed,
+                          levels = c(F,T),
+                          labels = c("Observed", "Imputed")))
+
+# Loop through all factor
+for (v in other_vars) {
+  #print a name of the variable
+  print(v)
+  
+  # Create the proportion table
+  tb <- prop.table(table(imp.dat[[v]], imp.dat$imputed), margin = 2)
+  
+  # Round the proportion table to 3 decimal places
+  tb_rounded <- round(tb, 3)
+  
+  # Print the rounded table
+  print(tb_rounded)
+}
+```
+
+All factor variables, in average, d have the same imputed and observed values.
+
+#### Intermediate Conclusion
+
+The random forest demostrated a high imputation quality, but created unrealistic out-of-data outlier values for some variables because of low missingness, what is the main inherent downside of this method.
+
+### Predictive mean matching method (PMM):
+
+```{r}
+#| warning: TRUE
+
+# Record the start time
+start_time <- Sys.time()
+set.seed(2025)
+
+# 1) First run mice with maxit=0 to get the initial predictor matrix
+pmm_proj_multiimp <- futuremice(
+  c66_project_df_fil_1, 
+  maxit = 0, 
+  parallelseed = 2025, 
+  defaultMethod = c("pmm", "rf", "rf", "rf"),
+  print = FALSE
+)
+
+# 2) Extract the predictor matrix
+pred <- pmm_proj_multiimp$pred
+
+# -- PART A: Set combined variables as zero predictors for variables that were used to create them in order to avoid circularity
+pred[c("c66_46_avrsybp", "c66_46_avrdibp"), 
+     "c66_46_c_ht"] <- 0
+
+pred[c("c66_46_avrsybp", "c66_46_avrdibp", "c66_46_c_ht", 
+       "c66_46_q1_ht", "c66_46_ht_med"), 
+     "c66_46_ht_comb"] <- 0
+
+pred["c66_46_chol", "c66_46_hpcl"] <- 0
+
+pred[c("c66_46_glc","c66_46_gluc2h", "c66_46_q1_dbt1", "c66_46_q1_dbt2"),
+     "c66_46_diab"] <- 0
+
+pred[c("c66_46_season"), "c66_46_season_c_w"] <- 0
+
+pred["c66_46_c_bmi" ,"c66_46_c_bmi_cat"] <- 0
+
+#passive imputation of the bmi_categorical variable
+meth = pmm_proj_multiimp$method
+
+meth["c66_46_season_c_w"] <- "~I(
+  factor(
+    ifelse(
+      c66_46_season == 'Winter' | c66_46_season == 'Spring',
+      'Cold',
+      'Warm'
+    ),
+    levels = c('Cold', 'Warm')
+  )
+)"
+
+meth["c66_46_c_ht"] <- "~I(
+  factor(
+    ifelse(
+      c66_46_avrsybp >= 140 | c66_46_avrdibp >= 90,
+      'Yes',
+      'No'
+    ),
+    levels = c('No', 'Yes')
+  )
+)"
+
+meth["c66_46_c_bmi_cat"] <- "~I(
+  factor(
+    ifelse(c66_46_c_bmi < 30, 'Nonobese', 'Obese'), 
+    levels = c('Nonobese', 'Obese')
+  )
+)"
+
+meth["c66_46_diab"] <- "~I(
+  factor(
+    ifelse(
+      c66_46_gluc2h >= 11.1 | 
+      (c66_46_q1_dbt1 == 'Yes' | c66_46_q1_dbt2 == 'Yes') | 
+      c66_46_glc >= 7.0,
+      'Yes',
+      'No'
+    ),
+    levels = c('No', 'Yes')
+  )
+)"
+
+
+meth["c66_46_ht_comb"] <- "~I(
+  factor(
+    ifelse(c66_46_ht_med == 'Yes' | c66_46_q1_ht == 'Yes' | c66_46_c_ht == 'Yes', 
+           'Yes', 
+           'No'),
+    levels = c('No', 'Yes')
+  )
+)"
+
+
+meth["c66_46_hpcl"] <- "~I(
+  factor(
+    ifelse(c66_46_chol >= 6.216, 'Yes', 'No'),
+    levels = c('No','Yes')
+  )
+)"
+
+
+# -- PART B: Impute y1_app_temp_avg_46 from original climate variables (no reference to app_temp_sd_46)
+#set 0 variables as predictors for apparent temp. variables
+pred["y1_app_temp_avg_46", ] <- 0
+pred["y1_app_temp_sd_46", ] <- 0
+
+#dont use apparent as predictor due to high correl(>0.9) with avg.temp and temp.sd
+pred[ ,"y1_app_temp_avg_46"] <- 0
+pred[ ,"y1_app_temp_sd_46"] <- 0
+
+#dont use CIMT as predictor to high missingness(>50%)
+pred[ ,"c66_46_cimt_l_avg"] <- 0
+pred[ ,"c66_46_cimt_r_avg"] <- 0
+
+pred["y1_app_temp_avg_46", 
+     c("y1_avg_temp", "y1_avg_rh", "y1_avg_ws", 
+       "y1_sd_temp", "y1_sd_rh", "y1_sd_ws")] <- 1
+
+# Exclude y1_app_temp_avg_46 from predicting those climate variables
+pred[c("y1_avg_temp", "y1_avg_rh", "y1_avg_ws",
+       "y1_sd_temp", "y1_sd_rh", "y1_sd_ws"), 
+     "y1_app_temp_avg_46"] <- 0
+
+# -- PART C: Impute y1_app_temp_sd_46 from original climate vars (no reference to app_temp_avg_46)
+pred["y1_app_temp_sd_46", 
+     c("y1_sd_temp", "y1_sd_rh", "y1_sd_ws", 
+       "y1_avg_temp", "y1_avg_rh", "y1_avg_ws")] <- 1
+
+# Exclude y1_app_temp_sd_46 from predicting those original variables
+pred[c("y1_sd_temp", "y1_sd_rh", "y1_sd_ws",
+       "y1_avg_temp", "y1_avg_rh", "y1_avg_ws"),
+     "y1_app_temp_sd_46"] <- 0
+
+# -- PART D: Explicitly set no cross-prediction between y1_app_temp_avg_46 and y1_app_temp_sd_46
+pred["y1_app_temp_avg_46", "y1_app_temp_sd_46"] <- 0
+pred["y1_app_temp_sd_46", "y1_app_temp_avg_46"] <- 0
+
+# 3) Check the final predictor matrix if you wish
+pred
+
+# 4) Run the actual imputation with maxit=10
+pmm_proj_multiimp <- futuremice(
+  c66_project_df_fil_1, 
+  pred = pred,
+  method = meth,
+  defaultMethod = c("pmm", "rf", "rf", "rf"),
+  m = 100, 
+  maxit = 40, 
+  parallelseed = 2025,
+  print = FALSE
+)
+
+options(max.print = 10000)
+
+# Record the end time
+end_time <- Sys.time()
+
+# Calculate and print the elapsed time
+elapsed_time <- end_time - start_time
+print(elapsed_time)
+```
+
+### Check convergence:
+
+```{r}
+set.seed(2025)
+# Identify variables with missing values
+other_vars <- names(c66_project_df_fil_1)[colSums(is.na(c66_project_df_fil_1)) > 0]
+
+# Loop through all variables with missing values
+for (var in other_vars) {
+  # Generate the convergence plot
+  plot_obj <- plot(pmm_proj_multiimp, y = var)
+  
+  # Create a text grob with the variable name
+  title <- grid::textGrob(paste("Convergence of", var), gp = grid::gpar(fontsize = 14, fontface = "bold"))
+  
+  # Combine the title and plot
+  gridExtra::grid.arrange(title, plot_obj, ncol = 1, heights = c(0.2, 1))
+}
+```
+
+Convergence is good for all variables.
+
+#### Filtering our rows with imputed outcome and exposure values
+
+##### BP dataset
+
+After performing imputation we delete rows with imputed BP outcome values and exposure + delete CIMT outcome variables:
+
+```{r}
+# Convert the mids object to long format and include the original data (.imp == 0)
+long_data <- complete(pmm_proj_multiimp, "long", include = TRUE)
+
+# Identify rows in the original data (.imp == 0) with missing outcome or exposure
+missing_rows <- long_data %>%
+  filter(.imp == 0 & (is.na(c66_46_avrsybp) | is.na(y1_avg_temp))) %>%
+  pull(.id)  # Extract the .id values of these rows
+
+# Filter out these rows from all imputations
+filtered_data <- long_data %>%
+  filter(!(.id %in% missing_rows))%>%
+  select(-c66_46_cimt_l_avg, -c66_46_cimt_r_avg)
+
+# Convert the filtered data back to a mids object
+pmm_proj_multiimp <- as.mids(filtered_data)
+
+summary(complete(pmm_proj_multiimp))
+```
+
+##### CIMT dataset
+
+Create a new object for the CIMT outcome.
+
+```{r}
+#Filter rows where `c66_46_cimt_r_avg` and "c66_46_cimt_l_avg" was missing in the original data for all datasets = exclude rows with missing outcome and exposure + delete BP outcome variables
+# Identify rows in the original data (.imp == 0) with missing outcome or exposure
+missing_rows <- long_data %>%
+  filter(.imp == 0 & (is.na(c66_46_cimt_r_avg) | is.na(c66_46_cimt_l_avg) | is.na(y1_avg_temp))) %>%
+  pull(.id)  # Extract the .id values of these rows
+
+# Filter out these rows from all imputations
+filtered_data <- long_data %>%
+  filter(!(.id %in% missing_rows))%>%
+  select(-c66_46_avrsybp, -c66_46_avrdibp)
+
+# Convert the filtered data back to a mids object
+pmm_proj_multiimp_cimt <- as.mids(filtered_data)
+
+summary(complete(pmm_proj_multiimp_cimt))
+```
+
+#### Mean comparison between imputed and non-imputed datasets
+
+Next compare means between different imputed datasets.
+
+First create a dataframe with comparison of means of imputed vs non-imputed dataframes.
+
+##### BP dataset
+
+```{r}
+#| warning: false
+# Initialize an empty list to collect results
+results_list <- list()
+# Get numeric variable names
+other_vars <- names(c66_project_df_fil_1)[sapply(c66_project_df_fil_1, is.numeric)]
+# Exclude the variables that were imputed but the observations were deleted
+other_vars <- setdiff(other_vars, c("c66_46_cimt_l_avg", "c66_46_cimt_r_avg", "y1_avg_temp", 
+                                    "c66_46_avrsybp", "c66_46_avrdibp", "y1_avg_temp", "y1_sd_temp", 
+                                    "y1_app_temp_avg_46", "y1_app_temp_sd_46", "y1_avg_rh",
+                                    "y1_avg_ws", "y1_sd_rh", "y1_sd_ws"))  
+
+# Loop through numeric variables
+for (var in other_vars) {
+  # Compute the means for all imputations
+  imputed_means <- with(pmm_proj_multiimp, mean(get(var)))$analyses
+  
+  # Compute the mean from the original non-imputed dataset
+  original_mean <- mean(c66_project_df_fil_1[[var]], na.rm = TRUE)
+  
+  # Combine the results for this variable: original + imputed
+  variable_means <- c(original_mean, unlist(imputed_means))
+  
+  # Store the results in the list with the variable name
+  results_list[[var]] <- variable_means
+}
+
+# Combine all variables into a single dataframe
+results_df <- sapply(results_list, cbind)
+
+# Add row names to indicate imputations and non-imputed
+rownames(results_df) <- c("Non-imputed", paste0("Imputation_", seq_len(nrow(results_df) - 1)))
+
+# Convert to a tibble for better display
+results_df <- as.data.frame(results_df)
+
+# Print the resulting dataframe
+results_df
+```
+
+Calculate bias between original (non-imputed) mean and imputed means:
+
+```{r}
+
+# Loop through numeric variables
+for (var in other_vars) {
+  # Add a section title for each variable
+  cat("\n### Summary and Bias for variable:", var, "\n\n")
+  
+  # Compute the mean for imputed datasets
+  imputed_means <- with(pmm_proj_multiimp, mean(get(var)))$analyses
+  
+  # Average the means across imputations
+  imputed_mean <- mean(unlist(imputed_means))
+  
+  # Compute the mean from the original non-imputed dataset
+  original_mean <- mean(c66_project_df_fil_1[[var]], na.rm = TRUE)
+  
+  # Calculate the bias
+  bias <- imputed_mean - original_mean
+  
+  # Print the results
+  cat("Original mean (non-imputed):", original_mean, "\n")
+  cat("Imputed mean (average across imputations):", imputed_mean, "\n")
+  cat("Bias (Imputed - Original):", bias, "\n\n")
+}
+```
+
+The visible difference is observed for `c66_46_gluc2h` (bias=0.13).
+
+##### CIMT dataset:
+
+```{r}
+#| warning: false
+# Initialize an empty list to collect results
+results_list <- list()
+# Get numeric variable names
+# Get numeric variable names
+other_vars <- names(c66_project_df_fil_1)[sapply(c66_project_df_fil_1, is.numeric)]
+# Exclude the variables that were imputed but the observations were deleted
+other_vars <- setdiff(other_vars, c("c66_46_cimt_l_avg", "c66_46_cimt_r_avg", "y1_avg_temp", 
+                                    "c66_46_avrsybp", "c66_46_avrdibp", "y1_avg_temp", "y1_sd_temp", 
+                                    "y1_app_temp_avg_46", "y1_app_temp_sd_46", "y1_avg_rh",
+                                    "y1_avg_ws", "y1_sd_rh", "y1_sd_ws")) 
+
+# Loop through numeric variables
+for (var in other_vars) {
+  # Compute the means for all imputations
+  imputed_means <- with(pmm_proj_multiimp_cimt, mean(get(var)))$analyses
+  
+  # Compute the mean from the original non-imputed dataset
+  original_mean <- mean(c66_project_df_fil_1[[var]], na.rm = TRUE)
+  
+  # Combine the results for this variable: original + imputed
+  variable_means <- c(original_mean, unlist(imputed_means))
+  
+  # Store the results in the list with the variable name
+  results_list[[var]] <- variable_means
+}
+
+# Combine all variables into a single dataframe
+results_df <- sapply(results_list, cbind)
+
+# Add row names to indicate imputations and non-imputed
+rownames(results_df) <- c("Non-imputed", paste0("Imputation_", seq_len(nrow(results_df) - 1)))
+
+# Convert to a tibble for better display
+results_df <- as.data.frame(results_df)
+
+# Print the resulting dataframe
+results_df
+```
+
+Calculate bias:
+
+```{r}
+
+# Loop through numeric variables
+for (var in other_vars) {
+  # Add a section title for each variable
+  cat("\n### Summary and Bias for variable:", var, "\n\n")
+  
+  # Compute the mean for imputed datasets
+  imputed_means <- with(pmm_proj_multiimp_cimt, mean(get(var)))$analyses
+  
+  # Average the means across imputations
+  imputed_mean <- mean(unlist(imputed_means))
+  
+  # Compute the mean from the original non-imputed dataset
+  original_mean <- mean(c66_project_df_fil_1[[var]], na.rm = TRUE)
+  
+  # Calculate the bias
+  bias <- imputed_mean - original_mean
+  
+  # Print the results
+  cat("Original mean (non-imputed):", original_mean, "\n")
+  cat("Imputed mean (average across imputations):", imputed_mean, "\n")
+  cat("Bias (Imputed - Original):", bias, "\n\n")
+}
+```
+
+The same bias for the `c66_46_gluc2h` variable.
+
+#### Imputation diagnostic
+
+Assess the imputation performance:
+
+##### BP dataset check
+
+```{r}
+#Box-plots of observed vs imputed datasets
+bwplot(pmm_proj_multiimp, c66_46_c_bmi ~ .imp)
+bwplot(pmm_proj_multiimp, c66_46_gluc2h ~ .imp)
+bwplot(pmm_proj_multiimp, c66_46_phys ~ .imp)
+bwplot(pmm_proj_multiimp, c66_46_chol ~ .imp)
+bwplot(pmm_proj_multiimp, c66_46_glc ~ .imp)
+bwplot(pmm_proj_multiimp, day_mean ~ .imp)
+
+#Stripplots for imputed numeric variables
+stripplot(pmm_proj_multiimp, c66_46_c_bmi ~ .imp,
+          col = c("gray", "black"),
+          pch = c(21, 20),
+          cex = c(1, 1.5))
+
+stripplot(pmm_proj_multiimp, c66_46_gluc2h ~ .imp,
+          col = c("gray", "black"),
+          pch = c(21, 20),
+          cex = c(1, 1.5))
+
+stripplot(pmm_proj_multiimp, c66_46_phys ~ .imp,
+          col = c("gray", "black"),
+          pch = c(21, 20),
+          cex = c(1, 1.5))
+
+stripplot(pmm_proj_multiimp, c66_46_chol ~ .imp,
+          col = c("gray", "black"),
+          pch = c(21, 20),
+          cex = c(1, 1.5))
+
+stripplot(pmm_proj_multiimp, c66_46_glc ~ .imp,
+          col = c("gray", "black"),
+          pch = c(21, 20),
+          cex = c(1, 1.5))
+
+stripplot(pmm_proj_multiimp, day_mean ~ .imp,
+          col = c("gray", "black"),
+          pch = c(21, 20),
+          cex = c(1, 1.5))
+
+```
+
+All imputed values lie in the observed values range, nicely distributed. Pmm performed better here than random forest. Odd boxplots for bmi and cholesterol are caused by a low number of missing values.
+
+Next, compare the distributions of observed data and imputed data. Under MCAR the distributions should be similar, but under MAR they can vary.
+
+```{r}
+densityplot(pmm_proj_multiimp)
+```
+
+Pmm produces density plots that are more stable and closer to the observed data than random forest does.
+
+To compare the distributions of observed and imputed data under MAR we should condition on the missingness probability. The idea is that under MAR the conditional distributions should be similar if the assumed model for creating multiple imputations has a good fit. 
+
+```{r}
+#model the probability of each record being incomplete as a function of all variables in each imputed dataset
+fit <- with(pmm_proj_multiimp, glm(ici(pmm_proj_multiimp) ~ c66_46_q1_dbt1 + c66_46_q1_dbt2 + c66_46_q1_ht + c66_46_c_ht+
+                                     c66_46_avrsybp +  c66_46_avrdibp + c66_46_c_bmi + c66_46_gluc2h + c66_46_ht_med +
+                                     c66_46_edu + c66_46_ht_med + 
+                                 c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup + c66_46_ap_age + sex +
+                                 c66_46_chol + c66_46_glc + c66_46_diab + c66_46_hpcl + c66_46_ht_comb + c66_46_season+
+                                 day_mean + y1_avg_temp + y1_sd_temp + y1_app_temp_avg_46 + y1_app_temp_sd_46 + y1_avg_rh +
+                                 y1_avg_ws + y1_sd_rh + y1_sd_ws,
+                     family = binomial))
+
+#The probabilities (propensities) are then averaged over the imputed datasets to obtain stability
+ps <- rep(rowMeans(sapply(fit$analyses, fitted.values)),
+          pmm_proj_multiimp$m + 1)
+
+#Plot variables against the propensity score in each dataset
+xyplot(pmm_proj_multiimp, c66_46_c_bmi ~ ps | as.factor(.imp),
+       xlab = "Probability that record is incomplete",
+       ylab = "BMI", pch = c(1, 19), col = mdc(1:2))
+
+xyplot(pmm_proj_multiimp, c66_46_gluc2h ~ ps | as.factor(.imp),
+       xlab = "Probability that record is incomplete",
+       ylab = "gluc2h", pch = c(1, 19), col = mdc(1:2))
+
+xyplot(pmm_proj_multiimp, c66_46_phys ~ ps | as.factor(.imp),
+       xlab = "Probability that record is incomplete",
+       ylab = "phys act", pch = c(1, 19), col = mdc(1:2))
+
+xyplot(pmm_proj_multiimp, c66_46_chol ~ ps | as.factor(.imp),
+       xlab = "Probability that record is incomplete",
+       ylab = "chol lvl", pch = c(1, 19), col = mdc(1:2))
+
+xyplot(pmm_proj_multiimp, c66_46_glc ~ ps | as.factor(.imp),
+       xlab = "Probability that record is incomplete",
+       ylab = "glc lvl", pch = c(1, 19), col = mdc(1:2))
+
+xyplot(pmm_proj_multiimp, day_mean ~ ps | as.factor(.imp),
+       xlab = "Probability that record is incomplete",
+       ylab = "day_mean", pch = c(1, 19), col = mdc(1:2))
+```
+
+In comparison to the random forest, imputed data points of `day_mean` are shifted less to the right, and `gluc2h` is not shifted at all. No meaningless outliers in any variables. Overall, the distributions of the blue and red points are quite similar, as expected under MAR.
+
+Imputation for categorical variables:
+
+```{r}
+# Include only factor variables
+other_vars = names(c66_project_df_fil_1)[sapply(c66_project_df_fil_1, is.factor)]
+
+imp.dat <- complete(pmm_proj_multiimp, "long", include = TRUE)
+
+#create a new factor variable, that indicates imputed observations
+imp.dat <- imp.dat %>% 
+  mutate(imputed = .imp > 0,
+         imputed = factor(imputed,
+                          levels = c(F,T),
+                          labels = c("Observed", "Imputed")))
+
+# Loop through all factor
+for (v in other_vars) {
+  #print a name of the variable
+  print(v)
+  
+  # Create the proportion table
+  tb <- prop.table(table(imp.dat[[v]], imp.dat$imputed), margin = 2)
+  
+  # Round the proportion table to 3 decimal places
+  tb_rounded <- round(tb, 3)
+  
+  # Print the rounded table
+  print(tb_rounded)
+}
+```
+
+In average, imputed categorical values are identical to observed ones, which indicates good imputation quality.
+
+##### CIMT dataset
+
+Repeat the same workflow with filtered CIMT dataset:
+
+```{r}
+#Box-plots of observed vs imputed datasets
+bwplot(pmm_proj_multiimp_cimt, c66_46_c_bmi ~ .imp)
+bwplot(pmm_proj_multiimp_cimt, c66_46_gluc2h ~ .imp)
+bwplot(pmm_proj_multiimp_cimt, c66_46_phys ~ .imp)
+bwplot(pmm_proj_multiimp_cimt, c66_46_chol ~ .imp)
+bwplot(pmm_proj_multiimp_cimt, c66_46_glc ~ .imp)
+bwplot(pmm_proj_multiimp_cimt, day_mean ~ .imp)
+
+#Stripplots for imputed numeric variables
+stripplot(pmm_proj_multiimp_cimt, c66_46_c_bmi ~ .imp,
+          col = c("gray", "black"),
+          pch = c(21, 20),
+          cex = c(1, 1.5))
+
+stripplot(pmm_proj_multiimp_cimt, c66_46_gluc2h ~ .imp,
+          col = c("gray", "black"),
+          pch = c(21, 20),
+          cex = c(1, 1.5))
+
+stripplot(pmm_proj_multiimp_cimt, c66_46_phys ~ .imp,
+          col = c("gray", "black"),
+          pch = c(21, 20),
+          cex = c(1, 1.5))
+
+stripplot(pmm_proj_multiimp_cimt, c66_46_chol ~ .imp,
+          col = c("gray", "black"),
+          pch = c(21, 20),
+          cex = c(1, 1.5))
+
+stripplot(pmm_proj_multiimp_cimt, c66_46_glc ~ .imp,
+          col = c("gray", "black"),
+          pch = c(21, 20),
+          cex = c(1, 1.5))
+
+stripplot(pmm_proj_multiimp_cimt, day_mean ~ .imp,
+          col = c("gray", "black"),
+          pch = c(21, 20),
+          cex = c(1, 1.5))
+```
+
+Only 1 imputed value for bmi and cholesterol, 2 imputed values for glucose. All imputed variables look similar to observed data.
+
+Density plots:
+
+```{r}
+densityplot(pmm_proj_multiimp_cimt)
+```
+
+Distributions look identical which implies MCAR and good imputation model.
+
+Conditional plots:
+
+```{r}
+#model the probability of each record being incomplete as a function of all variables in each imputed dataset
+fit <- with(pmm_proj_multiimp_cimt, glm(ici(pmm_proj_multiimp_cimt) ~ c66_46_q1_dbt1 + c66_46_q1_dbt2 + c66_46_q1_ht + c66_46_c_ht+
+                                      c66_46_cimt_l_avg + c66_46_cimt_r_avg + c66_46_c_bmi + c66_46_gluc2h + c66_46_ht_med + 
+                                      c66_46_edu + c66_46_ht_med + 
+                                      c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup + c66_46_ap_age + sex +
+                                      c66_46_chol + c66_46_glc + c66_46_diab + c66_46_hpcl + c66_46_ht_comb + c66_46_season+
+                                      day_mean + y1_avg_temp + y1_sd_temp + y1_app_temp_avg_46 + y1_app_temp_sd_46 + y1_avg_rh+
+                                      y1_avg_ws + y1_sd_rh + y1_sd_ws,
+                     family = binomial))
+
+#The probabilities (propensities) are then averaged over the imputed datasets to obtain stability
+ps <- rep(rowMeans(sapply(fit$analyses, fitted.values)),
+          pmm_proj_multiimp_cimt$m + 1)
+
+#Plot variables against the propensity score in each dataset
+xyplot(pmm_proj_multiimp_cimt, c66_46_c_bmi ~ ps | as.factor(.imp),
+       xlab = "Probability that record is incomplete",
+       ylab = "BMI", pch = c(1, 19), col = mdc(1:2))
+
+xyplot(pmm_proj_multiimp_cimt, c66_46_gluc2h ~ ps | as.factor(.imp),
+       xlab = "Probability that record is incomplete",
+       ylab = "gluc2h", pch = c(1, 19), col = mdc(1:2))
+
+xyplot(pmm_proj_multiimp_cimt, c66_46_phys ~ ps | as.factor(.imp),
+       xlab = "Probability that record is incomplete",
+       ylab = "phys act", pch = c(1, 19), col = mdc(1:2))
+
+xyplot(pmm_proj_multiimp_cimt, c66_46_chol ~ ps | as.factor(.imp),
+       xlab = "Probability that record is incomplete",
+       ylab = "chol lvl", pch = c(1, 19), col = mdc(1:2))
+
+xyplot(pmm_proj_multiimp_cimt, c66_46_glc ~ ps | as.factor(.imp),
+       xlab = "Probability that record is incomplete",
+       ylab = "glc lvl", pch = c(1, 19), col = mdc(1:2))
+
+xyplot(pmm_proj_multiimp_cimt, day_mean ~ ps | as.factor(.imp),
+       xlab = "Probability that record is incomplete",
+       ylab = "day_mean", pch = c(1, 19), col = mdc(1:2))
+```
+
+Imputed values of `day_mean` are noticably shifted to the right. Overall, the distributions of the blue and red points are quite similar, as expected under MAR.
+
+Factor variables check:
+
+```{r}
+# Include only factor variables
+other_vars = names(c66_project_df_fil_1)[sapply(c66_project_df_fil_1, is.factor)]
+
+imp.dat <- complete(pmm_proj_multiimp_cimt, "long", include = TRUE)
+
+#create a new factor variable, that indicates imputed observations
+imp.dat <- imp.dat %>% 
+  mutate(imputed = .imp > 0,
+         imputed = factor(imputed,
+                          levels = c(F,T),
+                          labels = c("Observed", "Imputed")))
+
+# Loop through all factor
+for (v in other_vars) {
+  #print a name of the variable
+  print(v)
+  
+  # Create the proportion table
+  tb <- prop.table(table(imp.dat[[v]], imp.dat$imputed), margin = 2)
+  
+  # Round the proportion table to 3 decimal places
+  tb_rounded <- round(tb, 3)
+  
+  # Print the rounded table
+  print(tb_rounded)
+}
+```
+
+All factor variables, in average, do have the same imputed and observed values.
+
+#### Final Conclusion
+
+The PMM produced a better imputation than random forest regarding outlier values and density plots for both datasets. The pmm imputed datasets will be used in the analysis.
+
+# Collinearity
+
+To detect collinearity an adjusted generalized standard error inflation factor (aGSIF) will be utilized. For each predictor, the aGSIF measures how much the variance of the regression coefficient estimate is inflated due to correlation between that predictor and the others. In comparison to variance inflation factor, aGSIF provides the collinearity estimate for the categorical variables as whole regardless of what reference level is selected and adjusted for the number of levels which allows for comparability with the other predictors.
+
+Since the GVIF values do not depend on the outcome variable, only systolic blood pressure will be used in the model formula.
+
+Only the variables potentially viable for the analysis will be included, with each exposure treated as a separate test. Due to multiple imputation, aGSIF will be computed for each imputed dataset and for all variables . The averaged estimates will be presented.
+
+#### Blood pressure dataset
+
+```{r}
+# 1. Extract all completed datasets as a list
+imputed_data_list <- complete(pmm_proj_multiimp, action = "all")
+
+# 2. Initialize an object to store VIF results
+m <- length(imputed_data_list)
+
+# 3. Loop over the imputed datasets, fit the model, extract aGSIF only
+vif_list <- vector("list", length = m)
+vif_list_2 <- vector("list", length = m)
+vif_list_3 <- vector("list", length = m)
+vif_list_4 <- vector("list", length = m)
+
+for(i in seq_len(m)) {
+  # Fit your model of choice on the ith imputed dataset
+  fit <- lm(c66_46_avrsybp ~ c66_46_c_bmi + c66_46_gluc2h + c66_46_c_bmi_cat + 
+              c66_46_ht_med + c66_46_edu + c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup + c66_46_ap_age + 
+              sex + c66_46_chol +  c66_46_glc + c66_46_diab + c66_46_hpcl + c66_46_q1_ht + c66_46_season + 
+              y1_avg_temp + day_mean + c66_46_urban_rural, data = imputed_data_list[[i]])
+  
+  fit_2 <- lm(c66_46_avrsybp ~ c66_46_c_bmi + c66_46_gluc2h + c66_46_c_bmi_cat + 
+              c66_46_ht_med + c66_46_edu + c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup + c66_46_ap_age + 
+              sex + c66_46_chol +  c66_46_glc + c66_46_diab + c66_46_hpcl + c66_46_q1_ht + c66_46_season + 
+              y1_sd_temp + day_mean + c66_46_urban_rural, data = imputed_data_list[[i]])
+  
+  fit_3 <- lm(c66_46_avrsybp ~ c66_46_c_bmi + c66_46_gluc2h + c66_46_c_bmi_cat + 
+              c66_46_ht_med + c66_46_edu + c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup + c66_46_ap_age + 
+              sex + c66_46_chol +  c66_46_glc + c66_46_diab + c66_46_hpcl + c66_46_q1_ht + c66_46_season + 
+              y1_app_temp_avg_46 + day_mean + c66_46_urban_rural, data = imputed_data_list[[i]])
+  
+  fit_4 <- lm(c66_46_avrsybp ~ c66_46_c_bmi + c66_46_gluc2h + c66_46_c_bmi_cat + 
+              c66_46_ht_med + c66_46_edu + c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup + c66_46_ap_age + 
+              sex + c66_46_chol +  c66_46_glc + c66_46_diab + c66_46_hpcl + c66_46_q1_ht + c66_46_season + 
+              y1_app_temp_sd_46 + day_mean + c66_46_urban_rural, data = imputed_data_list[[i]])
+  
+  # Extract adjusted generalized standardized inflation factor 
+  vif_list[[i]] <- car::vif(fit)[ ,3]
+  vif_list_2[[i]] <- car::vif(fit_2)[ ,3]
+  vif_list_3[[i]] <- car::vif(fit_3)[ ,3]
+  vif_list_4[[i]] <- car::vif(fit_4)[ ,3]
+}
+
+# 4. Aggregate across 20 imputations (mean value of the estimate)
+# binds all aGSIF vectors into a matrix
+vif_mat <- do.call(rbind, vif_list)  
+vif_mat_2 <- do.call(rbind, vif_list_2)
+vif_mat_3 <- do.call(rbind, vif_list_3)
+vif_mat_4 <- do.call(rbind, vif_list_4)
+
+paste("Average aGSIF over 20 imputed datasets exposure y1_avg_temp:")
+round(apply(vif_mat, 2, mean), 3)
+
+paste("Average aGSIF over 20 imputed datasets exposure y1_sd_temp:")
+round(apply(vif_mat_2, 2, mean), 3)
+
+paste("Average aGSIF over 20 imputed datasets exposure y1_app_temp_avg_46:")
+round(apply(vif_mat_3, 2, mean), 3)
+
+paste("Average aGSIF over 20 imputed datasets exposure y1_app_temp_sd_46:")
+round(apply(vif_mat_4, 2, mean), 3)
+```
+
+Moderate collinearity was detected in `c66_46_c_bmi`, `c66_46_c_bmi_cat`, `day_mean`.
+
+`c66_46_c_bmi_cat` variable is a categorized from `c66_46_c_bmi` .
+
+`day_mean` correlation should be investigated.
+
+Next, calculate a correlation between all continuous variables for the imputed data. The correct way is to calculate an estimate for each imputed dataset and average over the estimates. It is best to do a Fisher transformation before pooling the correlation estimates - and a backtransformation afterwards. Therefore we define the following two functions that allow us to transform and backtransform any value:
+
+```{r}
+#Fisher transformation of correlations
+fisher.trans <- function(x) 1/2 * log((1 + x) / (1 - x))
+
+#Backtransformation to original values
+fisher.backtrans <- function(x) (exp(2 * x) - 1) / (exp(2 * x) + 1)
+
+#Correlation for numeric variables and fisher transformation
+#cor is a list over the m  imputations where each listed index is a correlation matrix
+cor <- imputed_data_list %>%
+  map(~ select_if(.x, is.numeric)) %>%  
+  map(stats::cor) %>%
+  map(fisher.trans)
+
+#calculate the average over the correlation matrices (add the m listed indices and divide them by m)
+cor.rect <- Reduce("+", cor) / length(cor) # m is equal to the length of the list
+cor.rect <- fisher.backtrans(cor.rect)
+
+#Replace NaN on the diagonal with 1
+diag(cor.rect) <- 1
+round(cor.rect, digits = 2)
+
+#heatmap
+pheatmap(
+  cor.rect,
+  cluster_rows = TRUE,    # whether to cluster rows
+  cluster_cols = TRUE,    # whether to cluster columns
+  display_numbers = TRUE, # show correlation values in each cell
+  number_format = "%.2f", # format correlation values to 2 decimals
+  color = colorRampPalette(c("blue", "white", "red"))(50),
+  main = "Correlation Heatmap"
+)
+```
+
+`day_mean` does not correlate with other numeric variables. `c_66_46_ap_age` is moderately negatively correlated with exposure variables, however the aGSIF is relatively small.
+
+Lets calculate aGSIF for the fully adjusted model how it is planned in the stat plan:
+
+```{r}
+# 1. Extract all completed datasets as a list
+imputed_data_list <- complete(pmm_proj_multiimp, action = "all")
+
+# 2. Initialize an object to store VIF results
+m <- length(imputed_data_list)
+
+# 3. Loop over the imputed datasets, fit the model, extract aGSIF only
+vif_list <- vector("list", length = m)
+vif_list_2 <- vector("list", length = m)
+vif_list_3 <- vector("list", length = m)
+vif_list_4 <- vector("list", length = m)
+
+for(i in seq_len(m)) {
+  # Fit your model of choice on the ith imputed dataset
+  fit <- lm(c66_46_avrsybp ~ c66_46_q1_ht + c66_46_c_bmi+ c66_46_c_bmi_cat + c66_46_ht_med + c66_46_edu + 
+              c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup + c66_46_ap_age +
+              sex + c66_46_diab + c66_46_hpcl + c66_46_season + 
+              y1_avg_temp + day_mean + c66_46_urban_rural, data = imputed_data_list[[i]])
+  
+  fit_2 <- lm(c66_46_avrsybp ~ c66_46_q1_ht + c66_46_c_bmi + c66_46_c_bmi_cat + c66_46_ht_med + c66_46_edu + 
+              c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup + c66_46_ap_age +
+              sex + c66_46_diab + c66_46_hpcl + c66_46_season + 
+              y1_sd_temp + day_mean + c66_46_urban_rural, data = imputed_data_list[[i]])
+  
+  #without season
+  fit_3 <- lm(c66_46_avrsybp ~ c66_46_q1_ht + c66_46_c_bmi + c66_46_c_bmi_cat + c66_46_ht_med + c66_46_edu + 
+              c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup + c66_46_ap_age + 
+              sex + c66_46_diab + c66_46_hpcl + 
+              y1_app_temp_avg_46 + day_mean + c66_46_urban_rural, data = imputed_data_list[[i]])
+  
+  #without age at the day of assessment x
+  fit_4 <- lm(c66_46_avrsybp ~ c66_46_q1_ht + c66_46_c_bmi + c66_46_c_bmi_cat + c66_46_ht_med + c66_46_edu + 
+              c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup +  
+              sex + c66_46_diab + c66_46_hpcl + c66_46_season + 
+              y1_app_temp_sd_46 + day_mean + c66_46_urban_rural, data = imputed_data_list[[i]])
+  
+  # Extract adjusted generalized standardized inflation factor 
+  vif_list[[i]] <- car::vif(fit)[ ,3]
+  vif_list_2[[i]] <- car::vif(fit_2)[ ,3]
+  vif_list_3[[i]] <- car::vif(fit_3)[ ,3]
+  vif_list_4[[i]] <- car::vif(fit_4)[ ,3]
+}
+
+# 4. Aggregate across 20 imputations (mean value of the estimate)
+# binds all aGSIF vectors into a matrix
+vif_mat <- do.call(rbind, vif_list)  
+vif_mat_2 <- do.call(rbind, vif_list_2)
+vif_mat_3 <- do.call(rbind, vif_list_3)
+vif_mat_4 <- do.call(rbind, vif_list_4)
+
+paste("Average aGSIF over 20 imputed datasets exposure y1_avg_temp:")
+round(apply(vif_mat, 2, mean), 3)
+
+paste("Average aGSIF over 20 imputed datasets exposure y1_sd_temp:")
+round(apply(vif_mat_2, 2, mean), 3)
+
+paste("Average aGSIF over 20 imputed datasets exposure y1_app_temp_avg_46:")
+round(apply(vif_mat_3, 2, mean), 3)
+
+paste("Average aGSIF over 20 imputed datasets exposure y1_app_temp_sd_46:")
+round(apply(vif_mat_4, 2, mean), 3)
+```
+
+Replace `c66_46_season` with `c66_46_season_c_w` :
+
+```{r}
+# 1. Extract all completed datasets as a list
+imputed_data_list <- complete(pmm_proj_multiimp, action = "all")
+
+# 2. Initialize an object to store VIF results
+m <- length(imputed_data_list)
+
+# 3. Loop over the imputed datasets, fit the model, extract aGSIF only
+vif_list <- vector("list", length = m)
+vif_list_2 <- vector("list", length = m)
+vif_list_3 <- vector("list", length = m)
+vif_list_4 <- vector("list", length = m)
+
+for(i in seq_len(m)) {
+  # Fit your model of choice on the ith imputed dataset
+  fit <- lm(c66_46_avrsybp ~ c66_46_q1_ht + c66_46_c_bmi + c66_46_ht_med + c66_46_edu + 
+              c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup + c66_46_ap_age +
+              sex + c66_46_diab + c66_46_hpcl + c66_46_season_c_w + 
+              y1_avg_temp + day_mean + c66_46_urban_rural, data = imputed_data_list[[i]])
+  
+  fit_2 <- lm(c66_46_avrsybp ~ c66_46_q1_ht + c66_46_c_bmi + c66_46_ht_med + c66_46_edu + 
+              c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup + c66_46_ap_age +
+              sex + c66_46_diab + c66_46_hpcl + c66_46_season_c_w + 
+              y1_sd_temp + day_mean + c66_46_urban_rural, data = imputed_data_list[[i]])
+  
+  #without season_c_w
+  fit_3 <- lm(c66_46_avrsybp ~ c66_46_q1_ht + c66_46_c_bmi + c66_46_ht_med + c66_46_edu + 
+              c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup + c66_46_ap_age + 
+              sex + c66_46_diab + c66_46_hpcl + 
+              y1_app_temp_avg_46 + day_mean + c66_46_urban_rural, data = imputed_data_list[[i]])
+  
+  #without age at the day of assessment
+  fit_4 <- lm(c66_46_avrsybp ~ c66_46_q1_ht + c66_46_c_bmi + c66_46_ht_med + c66_46_edu + 
+              c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup +  
+              sex + c66_46_diab + c66_46_hpcl + c66_46_season_c_w + 
+              y1_app_temp_sd_46 + day_mean + c66_46_urban_rural, data = imputed_data_list[[i]])
+  
+  # Extract adjusted generalized standardized inflation factor 
+  vif_list[[i]] <- car::vif(fit)[ ,3]
+  vif_list_2[[i]] <- car::vif(fit_2)[ ,3]
+  vif_list_3[[i]] <- car::vif(fit_3)[ ,3]
+  vif_list_4[[i]] <- car::vif(fit_4)[ ,3]
+}
+
+# 4. Aggregate across 20 imputations (mean value of the estimate)
+# binds all aGSIF vectors into a matrix
+vif_mat <- do.call(rbind, vif_list)  
+vif_mat_2 <- do.call(rbind, vif_list_2)
+vif_mat_3 <- do.call(rbind, vif_list_3)
+vif_mat_4 <- do.call(rbind, vif_list_4)
+
+paste("Average aGSIF over 20 imputed datasets exposure y1_avg_temp:")
+round(apply(vif_mat, 2, mean), 3)
+
+paste("Average aGSIF over 20 imputed datasets exposure y1_sd_temp:")
+round(apply(vif_mat_2, 2, mean), 3)
+
+paste("Average aGSIF over 20 imputed datasets exposure y1_app_temp_avg_46:")
+round(apply(vif_mat_3, 2, mean), 3)
+
+paste("Average aGSIF over 20 imputed datasets exposure y1_app_temp_sd_46:")
+round(apply(vif_mat_4, 2, mean), 3)
+```
+
+The exclusion of `c66_46_ap_age` drastically decrease the aGSIF for `y1_sd_temp` and `y1_app_temp_sd_46` and vice versa.
+
+`c66_46_season` is the reason of relatively high value for `day_mean` (temperature at the day of assessment).
+
+`c66_46_season_c_w` helps to keep the collinearity low for main exposure variables, but brings over the threshold the `day_mean` and `c66_46_season_c_w` itself (1.560 and 1.609 respectively).
+
+**Conclusion:**
+
+Due to the fact that we are not really interested in the CI and estimates of `c66_46_season` and `day_mean` and the value of aGSIF is \~1.6 we can leave these variables in the analysis. However, `c66_46_season_c_w` decreases the multicollinearity for the main exposure variables for the small cost of increase in less important variables.
+
+aGSIF for `c66_46_ht_med` is lower than threshold, however exclusion of `c66_46_q1_ht` might be considered, because we are interested in the CI and point estimate for this variable.
+
+aGSIF for `y1_sd_temp` and `y1_app_temp_sd_46` is lower than threshold, however quite close to it. We are highly interested in the most precise parameters as possible, however there is no direct explanation why `c66_46_ap_age` is correlated with the temperature stand. deviation. Removal of `c66_46_ap_age` will be considered. Point estimate and CI of temp.stand. deviation will be compared with and without `c66_46_ap_age` .
+
+#### CIMT dataset
+
+```{r}
+# 1. Extract all completed datasets as a list
+imputed_data_list <- complete(pmm_proj_multiimp_cimt, action = "all")
+
+# 2. Initialize an object to store VIF results
+m <- length(imputed_data_list)
+
+# 3. Loop over the imputed datasets, fit the model, extract aGSIF only
+vif_list <- vector("list", length = m)
+vif_list_2 <- vector("list", length = m)
+vif_list_3 <- vector("list", length = m)
+vif_list_4 <- vector("list", length = m)
+
+for(i in seq_len(m)) {
+  # Fit your model of choice on the ith imputed dataset
+  fit <- lm(c66_46_cimt_r_avg ~ c66_46_ht_comb + c66_46_c_bmi + 
+              c66_46_edu + 
+              c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup +
+              c66_46_ap_age +
+              sex + c66_46_diab + c66_46_hpcl + c66_46_season + 
+              y1_avg_temp + day_mean + c66_46_urban_rural, data = imputed_data_list[[i]])
+  
+  #without age at the day of assessment
+  fit_2 <- lm(c66_46_cimt_r_avg ~ c66_46_ht_comb + c66_46_c_bmi + 
+                c66_46_edu + 
+                c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup +
+                sex + c66_46_diab + c66_46_hpcl + c66_46_season + 
+                y1_sd_temp + day_mean + c66_46_urban_rural, data = imputed_data_list[[i]])
+  
+  #without age at the day of assessment
+  fit_3 <- lm(c66_46_cimt_r_avg ~ c66_46_ht_comb + c66_46_c_bmi + 
+                c66_46_edu + 
+                c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup + 
+                sex + c66_46_diab + c66_46_hpcl + c66_46_season +
+                y1_app_temp_avg_46 + day_mean + c66_46_urban_rural, data = imputed_data_list[[i]])
+  
+  #without season
+  fit_4 <- lm(c66_46_cimt_r_avg ~ c66_46_ht_comb + c66_46_c_bmi + 
+                c66_46_edu + 
+                c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup +
+                c66_46_ap_age +
+                sex + c66_46_diab + c66_46_hpcl + 
+                y1_app_temp_sd_46 + day_mean + c66_46_urban_rural, data = imputed_data_list[[i]])
+  
+  # Extract adjusted generalized standardized inflation factor 
+  vif_list[[i]] <- car::vif(fit)[ ,3]
+  vif_list_2[[i]] <- car::vif(fit_2)[ ,3]
+  vif_list_3[[i]] <- car::vif(fit_3)[ ,3]
+  vif_list_4[[i]] <- car::vif(fit_4)[ ,3]
+}
+
+# 4. Aggregate across 20 imputations (mean value of the estimate)
+# binds all aGSIF vectors into a matrix
+vif_mat <- do.call(rbind, vif_list)  
+vif_mat_2 <- do.call(rbind, vif_list_2)
+vif_mat_3 <- do.call(rbind, vif_list_3)
+vif_mat_4 <- do.call(rbind, vif_list_4)
+
+paste("Average aGSIF over 20 imputed datasets exposure y1_avg_temp:")
+round(apply(vif_mat, 2, mean), 3)
+
+paste("Average aGSIF over 20 imputed datasets exposure y1_sd_temp:")
+round(apply(vif_mat_2, 2, mean), 3)
+
+paste("Average aGSIF over 20 imputed datasets exposure y1_app_temp_avg_46:")
+round(apply(vif_mat_3, 2, mean), 3)
+
+paste("Average aGSIF over 20 imputed datasets exposure y1_app_temp_sd_46:")
+round(apply(vif_mat_4, 2, mean), 3)
+```
+
+CIMT dataset has similar patterns, however:
+
+aGSIF values for `y1_app_temp_sd_46` and `y1_sd_temp` are significantly higher than in the BP dataset (2.453 and 2.113 respectively). The correlation of `y1_app_temp_sd_46` does not decrease a lot after the `c66_46_ap_age` removal. However, the deletion of `c66_46_season` drastically deacreses the aGSIF.
+
+Also, `y1_avg_temp` and `y1_app_temp_avg_46` have relatively increased aGSIF, but lower than the threshold. The removal of `c66_46_ap_age` has decreased the aGSIF from 1.346 to 1.093.
+
+Lets check what happens if we replace `c66_46_season` with `c66_46_season_c_w` (cold and warm seasons).
+
+```{r}
+# 1. Extract all completed datasets as a list
+imputed_data_list <- complete(pmm_proj_multiimp_cimt, action = "all")
+
+# 2. Initialize an object to store VIF results
+m <- length(imputed_data_list)
+
+# 3. Loop over the imputed datasets, fit the model, extract aGSIF only
+vif_list <- vector("list", length = m)
+vif_list_2 <- vector("list", length = m)
+vif_list_3 <- vector("list", length = m)
+vif_list_4 <- vector("list", length = m)
+
+for(i in seq_len(m)) {
+  # Fit your model of choice on the ith imputed dataset
+  fit <- lm(c66_46_cimt_r_avg ~ c66_46_ht_comb + c66_46_c_bmi + 
+              c66_46_edu + 
+              c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup +
+              c66_46_ap_age +
+              sex + c66_46_diab + c66_46_hpcl + c66_46_season_c_w + 
+              y1_avg_temp + day_mean + c66_46_urban_rural, data = imputed_data_list[[i]])
+  
+  
+  fit_2 <- lm(c66_46_cimt_r_avg ~ c66_46_ht_comb + c66_46_c_bmi + 
+                c66_46_edu + 
+                c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup +
+                c66_46_ap_age +
+                sex + c66_46_diab + c66_46_hpcl + c66_46_season_c_w + 
+                y1_sd_temp + day_mean + c66_46_urban_rural, data = imputed_data_list[[i]])
+  
+  #without age at the day of assessment 
+  fit_3 <- lm(c66_46_cimt_r_avg ~ c66_46_ht_comb + c66_46_c_bmi + 
+                c66_46_edu + 
+                c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup +
+                sex + c66_46_diab + c66_46_hpcl + c66_46_season_c_w +
+                y1_app_temp_avg_46 + day_mean + c66_46_urban_rural, data = imputed_data_list[[i]])
+  
+  #without age at the day of assessment
+  fit_4 <- lm(c66_46_cimt_r_avg ~ c66_46_ht_comb + c66_46_c_bmi + 
+                c66_46_edu + 
+                c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup +
+                sex + c66_46_diab + c66_46_hpcl + c66_46_season_c_w +
+                y1_app_temp_sd_46 + day_mean + c66_46_urban_rural, data = imputed_data_list[[i]])
+  
+  # Extract adjusted generalized standardized inflation factor 
+  vif_list[[i]] <- car::vif(fit)[ ,3]
+  vif_list_2[[i]] <- car::vif(fit_2)[ ,3]
+  vif_list_3[[i]] <- car::vif(fit_3)[ ,3]
+  vif_list_4[[i]] <- car::vif(fit_4)[ ,3]
+}
+
+# 4. Aggregate across 20 imputations (mean value of the estimate)
+# binds all aGSIF vectors into a matrix
+vif_mat <- do.call(rbind, vif_list)  
+vif_mat_2 <- do.call(rbind, vif_list_2)
+vif_mat_3 <- do.call(rbind, vif_list_3)
+vif_mat_4 <- do.call(rbind, vif_list_4)
+
+paste("Average aGSIF over 20 imputed datasets exposure y1_avg_temp:")
+round(apply(vif_mat, 2, mean), 3)
+
+paste("Average aGSIF over 20 imputed datasets exposure y1_sd_temp:")
+round(apply(vif_mat_2, 2, mean), 3)
+
+paste("Average aGSIF over 20 imputed datasets exposure y1_app_temp_avg_46:")
+round(apply(vif_mat_3, 2, mean), 3)
+
+paste("Average aGSIF over 20 imputed datasets exposure y1_app_temp_sd_46:")
+round(apply(vif_mat_4, 2, mean), 3)
+```
+
+Changing the season variable has strongly decreased the aGSIF for both `y1_app_temp_sd_46` and `y1_sd_temp` , but increased for `day_mean` and `c66_46_season_c_w` itself which is okay for us because we care only about the correlation for the important variables.
+
+Heatmap:
+
+```{r}
+#Fisher transformation of correlations
+fisher.trans <- function(x) 1/2 * log((1 + x) / (1 - x))
+
+#Backtransformation to original values
+fisher.backtrans <- function(x) (exp(2 * x) - 1) / (exp(2 * x) + 1)
+
+#Correlation for numeric variables and fisher transformation
+#cor is a list over the m  imputations where each listed index is a correlation matrix
+cor <- imputed_data_list %>%
+  map(~ select_if(.x, is.numeric)) %>%  
+  map(stats::cor) %>%
+  map(fisher.trans)
+
+#calculate the average over the correlation matrices (add the m listed indices and divide them by m)
+cor.rect <- Reduce("+", cor) / length(cor) # m is equal to the length of the list
+cor.rect <- fisher.backtrans(cor.rect)
+
+#Replace NaN on the diagonal with 1
+diag(cor.rect) <- 1
+round(cor.rect, digits = 2)
+
+#heatmap
+pheatmap(
+  cor.rect,
+  cluster_rows = TRUE,    # whether to cluster rows
+  cluster_cols = TRUE,    # whether to cluster columns
+  display_numbers = TRUE, # show correlation values in each cell
+  number_format = "%.2f", # format correlation values to 2 decimals
+  color = colorRampPalette(c("blue", "white", "red"))(50),
+  main = "Correlation Heatmap"
+)
+```
+
+#### Final conclusion
+
+Variables `c66_46_ap_age` and `c66_46_season` are the main source of multicollinearity. Despite the fact that in most cases aGSIF was not higher than the threshold 1.6 (except `y1_app_temp_sd_46` and `y1_sd_temp` in CIMT dataset), their influence should be carefully checked. BIC and Wald's test will clarify the situation with these variables: if their importance is low, there will not be any reason to leave them in the final model.
+
+Another way is to replace `c66_46_season` with `c66_46_season_c_w` . We lose some information because of the less informative variable, aGSIF in average is higher for `day_mean` and `c66_46_season_c_w` (a little bit over threshold sometimes), but at the same time we can leave this variable and keep the collinearity value very small for all exposure variables across BP and CIMT datasets.
+
+# Outliers detection
+
+First, we will apply Bonferroni Outlier Test. This tests each Studentized residual to see how likely we are to observe such an extreme value if the errors were truly t-distributed. While large outliers are rare, they are less rare in larger samples. Therefore, a Bonferroni adjustment is used to account for the increased chance of observing rare outcomes in larger samples. Observations are considered outliers if their Bonferroni p is \<.05.
+
+## Blood pressure
+
+```{r}
+# 1. Extract all completed (imputed) datasets as a list
+imputed_data_list <- complete(pmm_proj_multiimp, action = "all")
+m <- length(imputed_data_list)  # number of imputed datasets
+
+# 2. Define the outcomes
+outcomes <- c("c66_46_avrdibp", "c66_46_avrsybp")
+
+# 3. Initialize nested lists to store outlier test results for each model specification
+outl_1 <- vector("list", length = m)
+outl_2 <- vector("list", length = m)
+outl_3 <- vector("list", length = m)
+outl_4 <- vector("list", length = m)
+
+# Initialize stud_res as an empty data frame.
+stud_res <- data.frame(imputation = integer(),
+                       outcome = character(),
+                       rstudent = numeric(),
+                       obs_num = numeric(),
+                       bonf_p = numeric(),
+                       model = character(),
+                       stringsAsFactors = FALSE)
+
+# Loop over each imputed dataset
+for (i in seq_len(m)) {
+  # Initialize sublists for outcomes in the current imputed dataset
+  outl_1[[i]] <- vector("list", length = length(outcomes))
+  outl_2[[i]] <- vector("list", length = length(outcomes))
+  outl_3[[i]] <- vector("list", length = length(outcomes))
+  outl_4[[i]] <- vector("list", length = length(outcomes))
+  #extract i dataset from mids object
+  imputed_df <- complete(pmm_proj_multiimp, action = i)
+  # Loop over each outcome variable
+  for (j in seq_along(outcomes)) {
+    y <- outcomes[j]
+    
+    # Build the formulas dynamically so that y is interpreted as a variable name.
+    #formulas differ in exposure variable
+    formula1 <- as.formula(paste(
+      y, "~ c66_46_q1_ht + c66_46_c_bmi_cat + c66_46_ht_med + c66_46_edu +",
+      "c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup + ",
+      "sex + c66_46_diab + c66_46_hpcl + c66_46_season + y1_avg_temp + day_mean + c66_46_urban_rural"
+    ))
+    
+    formula2 <- as.formula(paste(
+      y, "~ c66_46_q1_ht + c66_46_c_bmi_cat + c66_46_ht_med + c66_46_edu +",
+      "c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup + ",
+      "sex + c66_46_diab + c66_46_hpcl + c66_46_season + y1_sd_temp + day_mean + c66_46_urban_rural"
+    ))
+    
+    formula3 <- as.formula(paste(
+      y, "~ c66_46_q1_ht + c66_46_c_bmi_cat + c66_46_ht_med + c66_46_edu +",
+      "c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup + ",
+      "sex + c66_46_diab + c66_46_hpcl + c66_46_season + y1_app_temp_avg_46 + day_mean + c66_46_urban_rural"
+    ))
+    
+    formula4 <- as.formula(paste(
+      y, "~ c66_46_q1_ht + c66_46_c_bmi_cat + c66_46_ht_med + c66_46_edu +",
+      "c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup + ",
+      "sex + c66_46_diab + c66_46_hpcl + c66_46_season + y1_app_temp_sd_46 + day_mean + c66_46_urban_rural"
+    ))
+    
+    # Fit the models on the ith imputed dataset
+    fit1 <- lm(formula1, data = imputed_df)
+    fit2 <- lm(formula2, data = imputed_df)
+    fit3 <- lm(formula3, data = imputed_df)
+    fit4 <- lm(formula4, data = imputed_df)
+    
+    # Run the outlier tests and store the full results.
+    outl_1[[i]][[j]] <- car::outlierTest(fit1, n.max = Inf)
+    outl_2[[i]][[j]] <- car::outlierTest(fit2, n.max = Inf)
+    outl_3[[i]][[j]] <- car::outlierTest(fit3, n.max = Inf)
+    outl_4[[i]][[j]] <- car::outlierTest(fit4, n.max = Inf)
+    
+    # Extract rstudent values from outl_1 (model specification 1)
+    rstud_vals_1 <- outl_1[[i]][[j]][["rstudent"]]
+    rstud_vals_2 <- outl_2[[i]][[j]][["rstudent"]]
+    rstud_vals_3 <- outl_3[[i]][[j]][["rstudent"]]
+    rstud_vals_4 <- outl_4[[i]][[j]][["rstudent"]]
+    
+    corr_p_value_1 = outl_1[[i]][[j]][["bonf.p"]]
+    corr_p_value_2 = outl_2[[i]][[j]][["bonf.p"]]
+    corr_p_value_3 = outl_3[[i]][[j]][["bonf.p"]]
+    corr_p_value_4 = outl_4[[i]][[j]][["bonf.p"]]
+    
+    # Create a temporary data frame with the rstudent values and observation numbers.
+    tmp <- data.frame(imputation = i,
+                      outcome = y,
+                      rstudent = as.numeric(rstud_vals_1),
+                      obs_num = as.numeric(names(rstud_vals_1)),
+                      bonf_p = as.numeric(corr_p_value_1),
+                      model = rep("y1_avg_temp", length(rstud_vals_1)),
+                      stringsAsFactors = FALSE)
+    stud_res <- rbind(stud_res, tmp)
+    
+    tmp <- data.frame(imputation = i,
+                      outcome = y,
+                      rstudent = as.numeric(rstud_vals_2),
+                      obs_num = as.numeric(names(rstud_vals_2)),
+                      bonf_p = as.numeric(corr_p_value_2),
+                      model = rep("y1_sd_temp", length(rstud_vals_2)),
+                      stringsAsFactors = FALSE)
+    stud_res <- rbind(stud_res, tmp)
+    
+    tmp <- data.frame(imputation = i,
+                      outcome = y,
+                      rstudent = as.numeric(rstud_vals_3),
+                      obs_num = as.numeric(names(rstud_vals_3)),
+                      bonf_p = as.numeric(corr_p_value_3),
+                      model = rep("y1_app_temp_avg_46", length(rstud_vals_3)),
+                      stringsAsFactors = FALSE)
+    stud_res <- rbind(stud_res, tmp)
+    
+    tmp <- data.frame(imputation = i,
+                      outcome = y,
+                      rstudent = as.numeric(rstud_vals_4),
+                      obs_num = as.numeric(names(rstud_vals_4)),
+                      bonf_p = as.numeric(corr_p_value_4),
+                      model = rep("y1_app_temp_sd_46", length(rstud_vals_4)),
+                      stringsAsFactors = FALSE)
+    stud_res <- rbind(stud_res, tmp)
+  }
+}
+
+#the lowest value of rstudent value among all iterations (will be used for plotting)
+min_values <- stud_res %>%
+  group_by(outcome) %>%
+  summarize(min_rstudent = min(rstudent, na.rm = TRUE))
+
+print(min_values)
+
+#Count how often an observation is an outlier
+#100 datasets * 2 outcomes * 4 exposures = 800 max repeats
+stud_res %>%
+  group_by(obs_num) %>%
+  count()
+```
+
+We see that observations #83, #2659 are outliers in all iterations (800/800 iterations). Other common outliers are #201, #3953, #5293. These rows will undergo a sensitivity analysis: the regression estimates with these values and without them will be compared. If their effect will be detectable, they will be treated either with removal or winsorizing.
+
+Next we plot Studentized residual vs fitted values to see the outliers but only for 1 imputed dataset just for illustration.
+
+```{r}
+
+imp = complete(pmm_proj_multiimp)
+
+fit1 <- lm(c66_46_avrsybp ~ c66_46_q1_ht + c66_46_c_bmi_cat + c66_46_ht_med + c66_46_edu +
+      c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup + 
+      sex + c66_46_diab + c66_46_hpcl + c66_46_season + y1_app_temp_avg_46 + day_mean + c66_46_urban_rural, data = imp)
+
+fit2 <- lm(c66_46_avrdibp ~ c66_46_q1_ht + c66_46_c_bmi_cat + c66_46_ht_med + c66_46_edu +
+      c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup + 
+      sex + c66_46_diab + c66_46_hpcl + c66_46_season + y1_app_temp_avg_46 + day_mean + c66_46_urban_rural, data = imp)
+
+fit3 <- lm(c66_46_avrsybp ~ c66_46_q1_ht + c66_46_c_bmi_cat + c66_46_ht_med + c66_46_edu +
+      c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup + 
+      sex + c66_46_diab + c66_46_hpcl + c66_46_season + y1_app_temp_sd_46 + day_mean + c66_46_urban_rural, data = imp)
+
+fit4 <- lm(c66_46_avrdibp ~ c66_46_q1_ht + c66_46_c_bmi_cat + c66_46_ht_med + c66_46_edu +
+      c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup + 
+      sex + c66_46_diab + c66_46_hpcl + c66_46_season + y1_app_temp_sd_46 + day_mean + c66_46_urban_rural, data = imp)
+
+# Compute Studentized residuals
+RSTUDENT_1 <- rstudent(fit1)
+RSTUDENT_2 <- rstudent(fit2)
+RSTUDENT_3 <- rstudent(fit3)
+RSTUDENT_4 <- rstudent(fit4)
+
+# Example 2: Suppose there are both positive and negative outliers
+#            and, among the positive outliers, the smallest is 4.62483
+#            and, among the negative outliers, the largest is -4.89398
+SUB1 <- RSTUDENT_1 > 4.4 | RSTUDENT_1 < -4.4
+SUB2 <- RSTUDENT_2 > 4.4 | RSTUDENT_2 < -4.4
+SUB3 <- RSTUDENT_3 > 4.4 | RSTUDENT_3 < -4.4
+SUB4 <- RSTUDENT_4 > 4.4 | RSTUDENT_4 < -4.4
+
+sum(SUB1)
+sum(SUB2)
+
+which(SUB1)
+# Plot Studentized residuals vs. fitted values
+car::residualPlots(fit1,
+                   pch=20, col="gray",
+                   fitted = T, terms = ~ 1,
+                   tests = F, quadratic = F,
+                   type = "rstudent")
+
+# Highlight outliers
+points(fitted(fit1)[SUB1], RSTUDENT_1[SUB1], pch=20, cex=1)
+
+# Plot Studentized residuals vs. fitted values
+car::residualPlots(fit2,
+                   pch=20, col="gray",
+                   fitted = T, terms = ~ 1,
+                   tests = F, quadratic = F,
+                   type = "rstudent")
+
+# Highlight outliers
+points(fitted(fit2)[SUB2], RSTUDENT_2[SUB2], pch=20, cex=1)
+
+# Plot Studentized residuals vs. fitted values
+car::residualPlots(fit3,
+                   pch=20, col="gray",
+                   fitted = T, terms = ~ 1,
+                   tests = F, quadratic = F,
+                   type = "rstudent")
+
+# Highlight outliers
+points(fitted(fit3)[SUB3], RSTUDENT_3[SUB3], pch=20, cex=1)
+
+# Plot Studentized residuals vs. fitted values
+car::residualPlots(fit4,
+                   pch=20, col="gray",
+                   fitted = T, terms = ~ 1,
+                   tests = F, quadratic = F,
+                   type = "rstudent")
+
+# Highlight outliers
+points(fitted(fit4)[SUB4], RSTUDENT_4[SUB4], pch=20, cex=1)
+```
+
+## CIMT
+
+Outliers for CIMT dataset:
+
+```{r}
+#| eval: false
+#| include: false
+# 1. Extract all completed (imputed) datasets as a list
+imputed_data_list <- complete(pmm_proj_multiimp_cimt, action = "all")
+m <- length(imputed_data_list)  # number of imputed datasets
+
+# 2. Define the outcomes
+outcomes <- c("c66_46_cimt_r_avg", "c66_46_cimt_l_avg")
+
+# 3. Initialize nested lists to store outlier test results for each model specification
+outl_1 <- vector("list", length = m)
+outl_2 <- vector("list", length = m)
+outl_3 <- vector("list", length = m)
+outl_4 <- vector("list", length = m)
+
+# Initialize stud_res as an empty data frame.
+stud_res_cimt <- data.frame(imputation = integer(),
+                       outcome = character(),
+                       rstudent = numeric(),
+                       obs_num = numeric(),
+                       bonf_p = numeric(),
+                       model = character(),
+                       stringsAsFactors = FALSE)
+
+# Loop over each imputed dataset
+for (i in seq_len(m)) {
+  # Initialize sublists for outcomes in the current imputed dataset
+  outl_1[[i]] <- vector("list", length = length(outcomes))
+  outl_2[[i]] <- vector("list", length = length(outcomes))
+  outl_3[[i]] <- vector("list", length = length(outcomes))
+  outl_4[[i]] <- vector("list", length = length(outcomes))
+  #extract i dataset from mids object
+  imputed_df <- complete(pmm_proj_multiimp_cimt, action = i)
+  
+  # Loop over each outcome variable
+  for (j in seq_along(outcomes)) {
+    y <- outcomes[j]
+    
+    # Build the formulas dynamically so that y is interpreted as a variable name.
+    #formulas differ in exposure variable
+    formula1 <- as.formula(paste(
+      y, "~ c66_46_ht_comb + c66_46_c_bmi_cat + c66_46_ht_med + c66_46_edu +",
+      "c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup + ",
+      "sex + c66_46_diab + c66_46_hpcl + c66_46_season + y1_avg_temp + day_mean + c66_46_urban_rural"
+    ))
+    
+    formula2 <- as.formula(paste(
+      y, "~ c66_46_ht_comb + c66_46_c_bmi_cat + c66_46_ht_med + c66_46_edu +",
+      "c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup + ",
+      "sex + c66_46_diab + c66_46_hpcl + c66_46_season + y1_sd_temp + day_mean + c66_46_urban_rural"
+    ))
+    
+    formula3 <- as.formula(paste(
+      y, "~ c66_46_ht_comb + c66_46_c_bmi_cat + c66_46_ht_med + c66_46_edu +",
+      "c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup + ",
+      "sex + c66_46_diab + c66_46_hpcl + c66_46_season + y1_app_temp_avg_46 + day_mean + c66_46_urban_rural"
+    ))
+    
+    formula4 <- as.formula(paste(
+      y, "~ c66_46_ht_comb + c66_46_c_bmi_cat + c66_46_ht_med + c66_46_edu +",
+      "c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup + ",
+      "sex + c66_46_diab + c66_46_hpcl + c66_46_season + y1_app_temp_sd_46 + day_mean + c66_46_urban_rural"
+    ))
+    
+    # Fit the models on the ith imputed dataset
+    fit1 <- lm(formula1, data = imputed_df)
+    fit2 <- lm(formula2, data = imputed_df)
+    fit3 <- lm(formula3, data = imputed_df)
+    fit4 <- lm(formula4, data = imputed_df)
+    
+    # Run the outlier tests and store the full results.
+    outl_1[[i]][[j]] <- car::outlierTest(fit1, n.max = Inf)
+    outl_2[[i]][[j]] <- car::outlierTest(fit2, n.max = Inf)
+    outl_3[[i]][[j]] <- car::outlierTest(fit3, n.max = Inf)
+    outl_4[[i]][[j]] <- car::outlierTest(fit4, n.max = Inf)
+    
+    # Extract rstudent values from outl_1 (model specification 1)
+    rstud_vals_1 <- outl_1[[i]][[j]][["rstudent"]]
+    rstud_vals_2 <- outl_2[[i]][[j]][["rstudent"]]
+    rstud_vals_3 <- outl_3[[i]][[j]][["rstudent"]]
+    rstud_vals_4 <- outl_4[[i]][[j]][["rstudent"]]
+    
+    corr_p_value_1 = outl_1[[i]][[j]][["bonf.p"]]
+    corr_p_value_2 = outl_2[[i]][[j]][["bonf.p"]]
+    corr_p_value_3 = outl_3[[i]][[j]][["bonf.p"]]
+    corr_p_value_4 = outl_4[[i]][[j]][["bonf.p"]]
+    
+    # Create a temporary data frame with the rstudent values and observation numbers.
+    tmp <- data.frame(imputation = i,
+                      outcome = y,
+                      rstudent = as.numeric(rstud_vals_1),
+                      obs_num = as.numeric(names(rstud_vals_1)),
+                      bonf_p = as.numeric(corr_p_value_1),
+                      model = rep("y1_avg_temp", length(rstud_vals_1)),
+                      stringsAsFactors = FALSE)
+    stud_res_cimt <- rbind(stud_res_cimt, tmp)
+    
+    tmp <- data.frame(imputation = i,
+                      outcome = y,
+                      rstudent = as.numeric(rstud_vals_2),
+                      obs_num = as.numeric(names(rstud_vals_2)),
+                      bonf_p = as.numeric(corr_p_value_2),
+                      model = rep("y1_sd_temp", length(rstud_vals_2)),
+                      stringsAsFactors = FALSE)
+    stud_res_cimt <- rbind(stud_res_cimt, tmp)
+    
+    tmp <- data.frame(imputation = i,
+                      outcome = y,
+                      rstudent = as.numeric(rstud_vals_3),
+                      obs_num = as.numeric(names(rstud_vals_3)),
+                      bonf_p = as.numeric(corr_p_value_3),
+                      model = rep("y1_app_temp_avg_46", length(rstud_vals_3)),
+                      stringsAsFactors = FALSE)
+    stud_res_cimt <- rbind(stud_res_cimt, tmp)
+    
+    tmp <- data.frame(imputation = i,
+                      outcome = y,
+                      rstudent = as.numeric(rstud_vals_4),
+                      obs_num = as.numeric(names(rstud_vals_4)),
+                      bonf_p = as.numeric(corr_p_value_4),
+                      model = rep("y1_app_temp_sd_46", length(rstud_vals_4)),
+                      stringsAsFactors = FALSE)
+    stud_res_cimt <- rbind(stud_res_cimt, tmp)
+  }
+}
+
+#the lowest value of rstudent value among all iterations (will be used for plotting)
+min_values <- stud_res_cimt %>%
+  group_by(outcome) %>%
+  summarize(min_rstudent = min(rstudent, na.rm = TRUE))
+
+print(min_values)
+
+#Count how often an observation is an outlier
+#20 datasets * 2 outcomes * 4 exposures = 160 max repeats
+stud_res_cimt %>%
+  group_by(obs_num) %>%
+  count()
+```
+
+We see that an observation #77 is an outlier in all iterations (160/160 iterations). Other common outliers are #365, 375, 590, 671, 951. These rows will undergo a sensitivity analysis: the regression estimates with these values and without them will be compared. If their effect will be detectable, they will be treated either with removal or winsonzering.
+
+Plot the outliers for 1 dataset:
+
+```{r}
+#| eval: false
+#| include: false
+imp = complete(pmm_proj_multiimp_cimt)
+
+fit1 <- lm(c66_46_cimt_r_avg ~ c66_46_ht_comb + c66_46_c_bmi_cat + c66_46_ht_med + c66_46_edu +
+      c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup + 
+      sex + c66_46_diab + c66_46_hpcl + c66_46_season + y1_avg_temp + day_mean + c66_46_urban_rural, data = imp)
+
+fit2 <- lm(c66_46_cimt_l_avg ~ c66_46_ht_comb + c66_46_c_bmi_cat + c66_46_ht_med + c66_46_edu +
+      c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup + 
+      sex + c66_46_diab + c66_46_hpcl + c66_46_season + y1_avg_temp + day_mean + c66_46_urban_rural, data = imp)
+
+# Compute Studentized residuals
+RSTUDENT_1 <- rstudent(fit1)
+RSTUDENT_2 <- rstudent(fit2)
+
+# Example 2: Suppose there are both positive and negative outliers
+#            and, among the positive outliers, the smallest is 4.62483
+#            and, among the negative outliers, the largest is -4.89398
+SUB1 <- RSTUDENT_1 > 4.09 | RSTUDENT_1 < -4.09
+SUB2 <- RSTUDENT_2 > 4.09 | RSTUDENT_2 < -4.09
+
+sum(SUB1)
+sum(SUB2)
+
+which(SUB1)
+# Plot Studentized residuals vs. fitted values
+car::residualPlots(fit1,
+                   pch=20, col="gray",
+                   fitted = T, terms = ~ 1,
+                   tests = F, quadratic = F,
+                   type = "rstudent")
+
+# Highlight outliers
+points(fitted(fit1)[SUB1], RSTUDENT_1[SUB1], pch=20, cex=1)
+
+# Plot Studentized residuals vs. fitted values
+car::residualPlots(fit2,
+                   pch=20, col="gray",
+                   fitted = T, terms = ~ 1,
+                   tests = F, quadratic = F,
+                   type = "rstudent")
+
+# Highlight outliers
+points(fitted(fit2)[SUB2], RSTUDENT_2[SUB2], pch=20, cex=1)
+```
+
+# Influential observations
+
+An observation is influential if it has high leverage AND big residual, which affects the magnitude of the estimates and SE. Influential observations pull the regression fit toward themselves. The results (predictions, parameter estimates, CIs, p-values) can be quite different with and without these cases included in the analysis.
+
+There will be utilized 3 methods that help to detect influential observations: Cook's distance, and DFbetas.
+
+## Blood pressure
+
+Plot Studentized residuals (outliers), leverage (hat values) and Cook's distance plots
+
+### Cook's distance
+
+```{r}
+# 1. Extract all completed (imputed) datasets as a list
+imputed_data_list <- complete(pmm_proj_multiimp, action = "all")
+m <- length(imputed_data_list)  # number of imputed datasets
+
+# 2. Define the outcomes
+outcomes <- c("c66_46_avrdibp","c66_46_avrsybp")
+
+# 3. Initialize cook_res as an empty data frame.
+cook_res <- data.frame(imputation = integer(),
+                       outcome = character(),
+                       cooks_dist = numeric(),
+                       obs_num = numeric(),
+                       model = character(),
+                       stringsAsFactors = FALSE)
+
+# 4. Loop over each imputed dataset
+for (i in seq_len(m)) {
+  imputed_df <- complete(pmm_proj_multiimp, action = i)
+  # Loop over each outcome variable
+  for (j in seq_along(outcomes)) {
+    y <- outcomes[j]
+    
+    # Build the formulas dynamically so that y is interpreted as a variable name.
+    #formulas differ in exposure variable
+    formula1 <- as.formula(paste(
+      y, "~ c66_46_q1_ht + c66_46_c_bmi_cat + c66_46_ht_med + c66_46_edu +",
+      "c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup + ",
+      "sex + c66_46_diab + c66_46_hpcl + c66_46_season + y1_avg_temp + day_mean + c66_46_urban_rural"
+    ))
+    
+    formula2 <- as.formula(paste(
+      y, "~ c66_46_q1_ht + c66_46_c_bmi_cat + c66_46_ht_med + c66_46_edu +",
+      "c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup + ",
+      "sex + c66_46_diab + c66_46_hpcl + c66_46_season + y1_sd_temp + day_mean + c66_46_urban_rural"
+    ))
+    
+    formula3 <- as.formula(paste(
+      y, "~ c66_46_q1_ht + c66_46_c_bmi_cat + c66_46_ht_med + c66_46_edu +",
+      "c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup + ",
+      "sex + c66_46_diab + c66_46_hpcl + c66_46_season + y1_app_temp_avg_46 + day_mean + c66_46_urban_rural"
+    ))
+    
+    formula4 <- as.formula(paste(
+      y, "~ c66_46_q1_ht + c66_46_c_bmi_cat + c66_46_ht_med + c66_46_edu +",
+      "c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup + ",
+      "sex + c66_46_diab + c66_46_hpcl + c66_46_season + y1_app_temp_sd_46 + day_mean + c66_46_urban_rural"
+    ))
+    
+    # Fit the models on the ith imputed dataset
+    fit1 <- lm(formula1, data = imputed_df)
+    fit2 <- lm(formula2, data = imputed_df)
+    fit3 <- lm(formula3, data = imputed_df)
+    fit4 <- lm(formula4, data = imputed_df)
+    
+    # Run the cook distance and store the full results.
+    cook_d1 <- stats::cooks.distance(fit1) 
+    cook_d2 <- stats::cooks.distance(fit2) 
+    cook_d3 <- stats::cooks.distance(fit3) 
+    cook_d4 <- stats::cooks.distance(fit4) 
+    
+    # Subjective cutoff from figure
+    sub.cook_1 = cook_d1 >= 0.0025
+    sub.cook_2 = cook_d2 >= 0.0025
+    sub.cook_3 = cook_d3 >= 0.0025
+    sub.cook_4 = cook_d4 >= 0.0025
+    
+    # View the extreme Cook's distance values and compare
+    # to plot to make sure you captured all you wanted to capture
+    cook_1 = cook_d1[sub.cook_1]
+    cook_2 = cook_d2[sub.cook_2]
+    cook_3 = cook_d3[sub.cook_3]
+    cook_4 = cook_d4[sub.cook_4]
+    
+    # Create a temporary data frame with the cooks_dist values and observation numbers.
+    tmp <- data.frame(imputation = i,
+                      outcome = y,
+                      cooks_dist = as.numeric(cook_1),
+                      obs_num = as.numeric(names(cook_1)),
+                      model = rep("y1_avg_temp", length(cook_1)),
+                      stringsAsFactors = FALSE)
+    cook_res <- rbind(cook_res, tmp)
+    
+    tmp <- data.frame(imputation = i,
+                      outcome = y,
+                      cooks_dist = as.numeric(cook_2),
+                      obs_num = as.numeric(names(cook_2)),
+                      model = rep("y1_sd_temp", length(cook_2)),
+                      stringsAsFactors = FALSE)
+    cook_res <- rbind(cook_res, tmp)
+    
+    tmp <- data.frame(imputation = i,
+                      outcome = y,
+                      cooks_dist = as.numeric(cook_3),
+                      obs_num = as.numeric(names(cook_3)),
+                      model = rep("y1_app_temp_avg_46", length(cook_3)),
+                      stringsAsFactors = FALSE)
+    cook_res <- rbind(cook_res, tmp)
+    
+    tmp <- data.frame(imputation = i,
+                      outcome = y,
+                      cooks_dist = as.numeric(cook_4),
+                      obs_num = as.numeric(names(cook_4)),
+                      model = rep("y1_app_temp_sd_46", length(cook_4)),
+                      stringsAsFactors = FALSE)
+    cook_res <- rbind(cook_res, tmp)
+    
+    # Generate the cook's plot , hide plotting the plot first time in object
+    plot_obj_list <- ols_plot_cooksd_chart(fit1, threshold = 0.0025, print_plot = F)
+    # Convert the ggplot object to a gtable for correct rendering
+    plot_obj <- plot_obj_list$plot
+    # Create a text grob with the variable name
+    title <- grid::textGrob(paste("Cook's plot of", y, "model fit1, imputed dataset #",i), 
+                            gp = grid::gpar(fontsize = 14, fontface = "bold"))
+    # Combine the title and plot
+    gridExtra::grid.arrange(title, plot_obj, ncol = 1, heights = c(0.2, 1))
+    
+    plot_obj_list <- ols_plot_cooksd_chart(fit2, threshold = 0.0025, print_plot = F)
+    # Convert the ggplot object to a gtable for correct rendering
+    plot_obj <- plot_obj_list$plot
+    # Create a text grob with the variable name
+    title <- grid::textGrob(paste("Cook's plot of", y, "model fit2, imputed dataset #",i), 
+                            gp = grid::gpar(fontsize = 14, fontface = "bold"))
+    # Combine the title and plot
+    gridExtra::grid.arrange(title, plot_obj, ncol = 1, heights = c(0.2, 1))
+    
+    plot_obj_list <- ols_plot_cooksd_chart(fit3, threshold = 0.0025, print_plot = F)
+    # Convert the ggplot object to a gtable for correct rendering
+    plot_obj <- plot_obj_list$plot
+    # Create a text grob with the variable name
+    title <- grid::textGrob(paste("Cook's plot of", y, "model fit3, imputed dataset #",i), 
+                            gp = grid::gpar(fontsize = 14, fontface = "bold"))
+    # Combine the title and plot
+    gridExtra::grid.arrange(title, plot_obj, ncol = 1, heights = c(0.2, 1))
+    
+    plot_obj_list <- ols_plot_cooksd_chart(fit4, threshold = 0.0025, print_plot = F)
+    # Convert the ggplot object to a gtable for correct rendering
+    plot_obj <- plot_obj_list$plot
+    # Create a text grob with the variable name
+    title <- grid::textGrob(paste("Cook's plot of", y, "model fit4, imputed dataset #",i), 
+                            gp = grid::gpar(fontsize = 14, fontface = "bold"))
+    # Combine the title and plot
+    gridExtra::grid.arrange(title, plot_obj, ncol = 1, heights = c(0.2, 1))
+  }
+}
+
+#the highest value of cook's distance value among all iterations 
+max_values <- cook_res %>%
+  group_by(outcome) %>%
+  summarize(max_cook = max(cooks_dist, na.rm = TRUE))
+
+print(max_values)
+
+#Count how often an observation is an influential point from the cook's distance metric
+#20 datasets * 2 outcomes * 4 exposures = 160 max repeats
+cook_res %>%
+  group_by(obs_num) %>%
+  count()
+
+
+#Plot of studentized residuals and leverage
+ols_plot_resid_lev(fit1, threshold = 4.5)
+```
+
+36 influential observations have been detected. Among them only 10 were consistently appearing in more than 400/800 iterations. Only these values will be analyzed during sensitivity analysis as influential observations.
+
+### DFBetas
+
+Standardized DFBetas measure, for each observation, the standardized difference in *individual* regression coefficient estimates when fitting the model with and without that observation, providing a measure of influence on each coefficient.
+
+We will pool infl. observations over all imputed datasets and models:
+
+```{r}
+# 1. Extract all completed (imputed) datasets as a list
+imputed_data_list <- complete(pmm_proj_multiimp, action = "all")
+m <- length(imputed_data_list)  # number of imputed datasets
+
+# 2. Define the outcomes
+outcomes <- c("c66_46_avrdibp","c66_46_avrsybp")
+
+# 3. Initialize dfbetas_res as an empty data frame.
+dfbetas_res <- data.frame(imputation = integer(),
+                       outcome = character(),
+                       df_betas = numeric(),
+                       obs_num = numeric(),
+                       model = character(),
+                       stringsAsFactors = FALSE)
+
+# 4. Loop over each imputed dataset
+for (i in seq_len(m)) {
+  imputed_df <- complete(pmm_proj_multiimp, action = i)
+  # Loop over each outcome variable
+  for (j in seq_along(outcomes)) {
+    y <- outcomes[j]
+    
+    # Build the formulas dynamically so that y is interpreted as a variable name.
+    #formulas differ in exposure variable
+    formula1 <- as.formula(paste(
+      y, "~ c66_46_q1_ht + c66_46_c_bmi_cat + c66_46_ht_med + c66_46_edu +",
+      "c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup + ",
+      "sex + c66_46_diab + c66_46_hpcl + c66_46_season + y1_avg_temp + day_mean + c66_46_urban_rural"
+    ))
+    
+    formula2 <- as.formula(paste(
+      y, "~ c66_46_q1_ht + c66_46_c_bmi_cat + c66_46_ht_med + c66_46_edu +",
+      "c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup + ",
+      "sex + c66_46_diab + c66_46_hpcl + c66_46_season + y1_sd_temp + day_mean + c66_46_urban_rural"
+    ))
+    
+    formula3 <- as.formula(paste(
+      y, "~ c66_46_q1_ht + c66_46_c_bmi_cat + c66_46_ht_med + c66_46_edu +",
+      "c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup + ",
+      "sex + c66_46_diab + c66_46_hpcl + c66_46_season + y1_app_temp_avg_46 + day_mean + c66_46_urban_rural"
+    ))
+    
+    formula4 <- as.formula(paste(
+      y, "~ c66_46_q1_ht + c66_46_c_bmi_cat + c66_46_ht_med + c66_46_edu +",
+      "c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup + ",
+      "sex + c66_46_diab + c66_46_hpcl + c66_46_season + y1_app_temp_sd_46 + day_mean + c66_46_urban_rural"
+    ))
+    
+    # Before fitting the model, assign a unique ID to each row:
+    imputed_df$ID <- seq_len(nrow(imputed_df))
+    
+    # Fit the models on the ith imputed dataset
+    fit1 <- lm(formula1, data = imputed_df)
+    fit2 <- lm(formula2, data = imputed_df)
+    fit3 <- lm(formula3, data = imputed_df)
+    fit4 <- lm(formula4, data = imputed_df)
+    
+    # Run the dfbetas and store the full results.
+    df_b1 <- dfbetas(fit1) 
+    df_b2 <- dfbetas(fit2) 
+    df_b3 <- dfbetas(fit3) 
+    df_b4 <- dfbetas(fit4) 
+    
+    # 0.2 cut-off based on the literature
+    sub.betas_1 = abs(df_b1) > 0.2
+    sub.betas_2 = abs(df_b2) > 0.2
+    sub.betas_3 = abs(df_b3) > 0.2
+    sub.betas_4 = abs(df_b4) > 0.2
+    
+    # Get the *row indices* from sub.betas_1
+    # (If 'df_b1' is a matrix, which(...) returns row & column indices)
+    row_idx_1 <- which(sub.betas_1, arr.ind = TRUE)[,1]
+    row_idx_2 <- which(sub.betas_2, arr.ind = TRUE)[,1]
+    row_idx_3 <- which(sub.betas_3, arr.ind = TRUE)[,1]
+    row_idx_4 <- which(sub.betas_4, arr.ind = TRUE)[,1]
+
+    # Use the stored 'ID' to track the actual row/subject
+    obs_ids_1 <- imputed_df$ID[row_idx_1]
+    obs_ids_2 <- imputed_df$ID[row_idx_2]
+    obs_ids_3 <- imputed_df$ID[row_idx_3]
+    obs_ids_4 <- imputed_df$ID[row_idx_4]
+    
+    # View the extreme dfbetas values and compare
+    dfbetas_1 = df_b1[sub.betas_1]
+    dfbetas_2 = df_b2[sub.betas_2]
+    dfbetas_3 = df_b3[sub.betas_3]
+    dfbetas_4 = df_b4[sub.betas_4]
+    
+    # Create a temporary data frame with the cooks_dist values and observation numbers.
+    tmp <- data.frame(imputation = i,
+                      outcome = y,
+                      df_betas = as.numeric(dfbetas_1),
+                      obs_num = obs_ids_1,
+                      model = rep("y1_avg_temp", length(dfbetas_1)),
+                      stringsAsFactors = FALSE)
+    dfbetas_res <- rbind(dfbetas_res, tmp)
+    
+    tmp <- data.frame(imputation = i,
+                      outcome = y,
+                      df_betas = as.numeric(dfbetas_2),
+                      obs_num = obs_ids_2,
+                      model = rep("y1_sd_temp", length(dfbetas_2)),
+                      stringsAsFactors = FALSE)
+    dfbetas_res <- rbind(dfbetas_res, tmp)
+    
+    tmp <- data.frame(imputation = i,
+                      outcome = y,
+                      df_betas = as.numeric(dfbetas_3),
+                      obs_num = obs_ids_3,
+                      model = rep("y1_app_temp_avg_46", length(dfbetas_3)),
+                      stringsAsFactors = FALSE)
+    dfbetas_res <- rbind(dfbetas_res, tmp)
+    
+    tmp <- data.frame(imputation = i,
+                      outcome = y,
+                      df_betas = as.numeric(dfbetas_4),
+                      obs_num = obs_ids_4,
+                      model = rep("y1_app_temp_sd_46", length(dfbetas_4)),
+                      stringsAsFactors = FALSE)
+    dfbetas_res <- rbind(dfbetas_res, tmp)
+    
+  }
+}
+
+#the highest value of df_betas value among all iterations 
+max_values <- dfbetas_res %>%
+  group_by(outcome) %>%
+  summarize(max_dfbetas = max(df_betas, na.rm = TRUE))
+
+print(max_values)
+
+#Count how often an observation is an influential point from the cook's distance metric
+#100 datasets * 2 outcomes * 4 exposures * 26 dummy var = 20800 max repeats
+dfbetas_res %>%
+  group_by(obs_num) %>%
+  count()
+
+
+dfbetas_res %>%
+  group_by(obs_num) %>%
+  count() %>%
+  filter(n >= (m*2*4)/2)
+```
+
+Overall 48 DFBetas values \>0.2 have been detected. Only 9 of them appear more than 400/800 times.
+
+Standardized DFBetas plots for 4 models for the last imputed dataset:
+
+```{r}
+#| eval: false
+#| include: false
+ols_plot_dfbetas(fit1)
+ols_plot_dfbetas(fit2)
+ols_plot_dfbetas(fit3)
+ols_plot_dfbetas(fit4)
+```
+
+## CIMT
+
+### Cook's distance
+
+```{r}
+#| eval: false
+#| include: false
+# 1. Extract all completed (imputed) datasets as a list
+imputed_data_list <- complete(pmm_proj_multiimp_cimt, action = "all")
+m <- length(imputed_data_list)  # number of imputed datasets
+
+# 2. Define the outcomes
+outcomes <- c("c66_46_cimt_l_avg","c66_46_cimt_r_avg")
+
+# 3. Initialize cook_res as an empty data frame.
+cook_res_cimt <- data.frame(imputation = integer(),
+                       outcome = character(),
+                       cooks_dist = numeric(),
+                       obs_num = numeric(),
+                       model = character(),
+                       stringsAsFactors = FALSE)
+
+# 4. Loop over each imputed dataset
+for (i in seq_len(m)) {
+  imputed_df <- complete(pmm_proj_multiimp_cimt, action = i)
+  # Loop over each outcome variable
+  for (j in seq_along(outcomes)) {
+    y <- outcomes[j]
+    
+    # Build the formulas dynamically so that y is interpreted as a variable name.
+    #formulas differ in exposure variable
+    formula1 <- as.formula(paste(
+      y, "~ c66_46_ht_comb + c66_46_c_bmi_cat + c66_46_ht_med + c66_46_edu +",
+      "c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup + ",
+      "sex + c66_46_diab + c66_46_hpcl + c66_46_season + y1_avg_temp + day_mean + c66_46_urban_rural"
+    ))
+    
+    formula2 <- as.formula(paste(
+      y, "~ c66_46_ht_comb + c66_46_c_bmi_cat + c66_46_ht_med + c66_46_edu +",
+      "c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup + ",
+      "sex + c66_46_diab + c66_46_hpcl + c66_46_season + y1_sd_temp + day_mean + c66_46_urban_rural"
+    ))
+    
+    formula3 <- as.formula(paste(
+      y, "~ c66_46_ht_comb + c66_46_c_bmi_cat + c66_46_ht_med + c66_46_edu +",
+      "c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup + ",
+      "sex + c66_46_diab + c66_46_hpcl + c66_46_season + y1_app_temp_avg_46 + day_mean + c66_46_urban_rural"
+    ))
+    
+    formula4 <- as.formula(paste(
+      y, "~ c66_46_ht_comb + c66_46_c_bmi_cat + c66_46_ht_med + c66_46_edu +",
+      "c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup + ",
+      "sex + c66_46_diab + c66_46_hpcl + c66_46_season + y1_app_temp_sd_46 + day_mean + c66_46_urban_rural"
+    ))
+    
+    # Fit the models on the ith imputed dataset
+    fit1 <- lm(formula1, data = imputed_df)
+    fit2 <- lm(formula2, data = imputed_df)
+    fit3 <- lm(formula3, data = imputed_df)
+    fit4 <- lm(formula4, data = imputed_df)
+    
+    # Run the cook distance and store the full results.
+    cook_d1 <- stats::cooks.distance(fit1) 
+    cook_d2 <- stats::cooks.distance(fit2) 
+    cook_d3 <- stats::cooks.distance(fit3) 
+    cook_d4 <- stats::cooks.distance(fit4) 
+    
+    # Subjective cutoff from figure
+    sub.cook_1 = cook_d1 >= 0.015
+    sub.cook_2 = cook_d2 >= 0.015
+    sub.cook_3 = cook_d3 >= 0.015
+    sub.cook_4 = cook_d4 >= 0.015
+    
+    # View the extreme Cook's distance values and compare
+    # to plot to make sure you captured all you wanted to capture
+    cook_1 = cook_d1[sub.cook_1]
+    cook_2 = cook_d2[sub.cook_2]
+    cook_3 = cook_d3[sub.cook_3]
+    cook_4 = cook_d4[sub.cook_4]
+    
+    # Create a temporary data frame with the cooks_dist values and observation numbers.
+    tmp <- data.frame(imputation = i,
+                      outcome = y,
+                      cooks_dist = as.numeric(cook_1),
+                      obs_num = as.numeric(names(cook_1)),
+                      model = rep("y1_avg_temp", length(cook_1)),
+                      stringsAsFactors = FALSE)
+    cook_res_cimt <- rbind(cook_res_cimt, tmp)
+    
+    tmp <- data.frame(imputation = i,
+                      outcome = y,
+                      cooks_dist = as.numeric(cook_2),
+                      obs_num = as.numeric(names(cook_2)),
+                      model = rep("y1_sd_temp", length(cook_2)),
+                      stringsAsFactors = FALSE)
+    cook_res_cimt <- rbind(cook_res_cimt, tmp)
+    
+    tmp <- data.frame(imputation = i,
+                      outcome = y,
+                      cooks_dist = as.numeric(cook_3),
+                      obs_num = as.numeric(names(cook_3)),
+                      model = rep("y1_app_temp_avg_46", length(cook_3)),
+                      stringsAsFactors = FALSE)
+    cook_res_cimt <- rbind(cook_res_cimt, tmp)
+    
+    tmp <- data.frame(imputation = i,
+                      outcome = y,
+                      cooks_dist = as.numeric(cook_4),
+                      obs_num = as.numeric(names(cook_4)),
+                      model = rep("y1_app_temp_sd_46", length(cook_4)),
+                      stringsAsFactors = FALSE)
+    cook_res_cimt <- rbind(cook_res_cimt, tmp)
+    
+    # Generate the cook's plot , hide plotting the plot first time in object
+    plot_obj_list <- ols_plot_cooksd_chart(fit1, threshold = 0.015, print_plot = F)
+    # Convert the ggplot object to a gtable for correct rendering
+    plot_obj <- plot_obj_list$plot
+    # Create a text grob with the variable name
+    title <- grid::textGrob(paste("Cook's plot of", y, "model fit1, imputed dataset #",i), 
+                            gp = grid::gpar(fontsize = 14, fontface = "bold"))
+    # Combine the title and plot
+    gridExtra::grid.arrange(title, plot_obj, ncol = 1, heights = c(0.2, 1))
+    
+    plot_obj_list <- ols_plot_cooksd_chart(fit2, threshold = 0.015, print_plot = F)
+    # Convert the ggplot object to a gtable for correct rendering
+    plot_obj <- plot_obj_list$plot
+    # Create a text grob with the variable name
+    title <- grid::textGrob(paste("Cook's plot of", y, "model fit2, imputed dataset #",i), 
+                            gp = grid::gpar(fontsize = 14, fontface = "bold"))
+    # Combine the title and plot
+    gridExtra::grid.arrange(title, plot_obj, ncol = 1, heights = c(0.2, 1))
+    
+    plot_obj_list <- ols_plot_cooksd_chart(fit3, threshold = 0.015, print_plot = F)
+    # Convert the ggplot object to a gtable for correct rendering
+    plot_obj <- plot_obj_list$plot
+    # Create a text grob with the variable name
+    title <- grid::textGrob(paste("Cook's plot of", y, "model fit3, imputed dataset #",i), 
+                            gp = grid::gpar(fontsize = 14, fontface = "bold"))
+    # Combine the title and plot
+    gridExtra::grid.arrange(title, plot_obj, ncol = 1, heights = c(0.2, 1))
+    
+    plot_obj_list <- ols_plot_cooksd_chart(fit4, threshold = 0.015, print_plot = F)
+    # Convert the ggplot object to a gtable for correct rendering
+    plot_obj <- plot_obj_list$plot
+    # Create a text grob with the variable name
+    title <- grid::textGrob(paste("Cook's plot of", y, "model fit4, imputed dataset #",i), 
+                            gp = grid::gpar(fontsize = 14, fontface = "bold"))
+    # Combine the title and plot
+    gridExtra::grid.arrange(title, plot_obj, ncol = 1, heights = c(0.2, 1))
+  }
+}
+
+#the highest value of cook's distance value among all iterations 
+max_values <- cook_res_cimt %>%
+  group_by(outcome) %>%
+  summarize(max_cook = max(cooks_dist, na.rm = TRUE))
+
+print(max_values)
+
+#Count how often an observation is an influential point from the cook's distance metric
+#20 datasets * 2 outcomes * 4 exposures = 160 max repeats
+cook_res_cimt %>%
+  group_by(obs_num) %>%
+  count() 
+
+cook_res_cimt %>%
+  group_by(obs_num) %>%
+  count() %>%
+  filter(n >= (m*2*4)/2)
+
+
+#Plot of studentized residuals and leverage
+ols_plot_resid_lev(fit1, threshold = 4.5)
+```
+
+23 infl. obs. have been detected overall. 15 of them do persist in more than 80/160 iterations.
+
+### DFBetas
+
+```{r}
+#| eval: false
+#| include: false
+# 1. Extract all completed (imputed) datasets as a list
+imputed_data_list <- complete(pmm_proj_multiimp_cimt, action = "all")
+m <- length(imputed_data_list)  # number of imputed datasets
+
+# 2. Define the outcomes
+outcomes <- c("c66_46_cimt_l_avg","c66_46_cimt_r_avg")
+
+# 3. Initialize dfbetas_res as an empty data frame.
+dfbetas_res_cimt <- data.frame(imputation = integer(),
+                       outcome = character(),
+                       df_betas = numeric(),
+                       obs_num = numeric(),
+                       model = character(),
+                       stringsAsFactors = FALSE)
+
+# 4. Loop over each imputed dataset
+for (i in seq_len(m)) {
+  imputed_df <- complete(pmm_proj_multiimp_cimt, action = i)
+  # Loop over each outcome variable
+  for (j in seq_along(outcomes)) {
+    y <- outcomes[j]
+    
+    # Build the formulas dynamically so that y is interpreted as a variable name.
+    #formulas differ in exposure variable
+    formula1 <- as.formula(paste(
+      y, "~ c66_46_q1_ht + c66_46_c_bmi_cat + c66_46_ht_med + c66_46_edu +",
+      "c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup + ",
+      "sex + c66_46_diab + c66_46_hpcl + c66_46_season + y1_avg_temp + day_mean + c66_46_urban_rural"
+    ))
+    
+    formula2 <- as.formula(paste(
+      y, "~ c66_46_q1_ht + c66_46_c_bmi_cat + c66_46_ht_med + c66_46_edu +",
+      "c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup + ",
+      "sex + c66_46_diab + c66_46_hpcl + c66_46_season + y1_sd_temp + day_mean + c66_46_urban_rural"
+    ))
+    
+    formula3 <- as.formula(paste(
+      y, "~ c66_46_q1_ht + c66_46_c_bmi_cat + c66_46_ht_med + c66_46_edu +",
+      "c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup + ",
+      "sex + c66_46_diab + c66_46_hpcl + c66_46_season + y1_app_temp_avg_46 + day_mean + c66_46_urban_rural"
+    ))
+    
+    formula4 <- as.formula(paste(
+      y, "~ c66_46_q1_ht + c66_46_c_bmi_cat + c66_46_ht_med + c66_46_edu +",
+      "c66_46_smok + c66_46_alc + c66_46_phys + c66_46_occup + ",
+      "sex + c66_46_diab + c66_46_hpcl + c66_46_season + y1_app_temp_sd_46 + day_mean + c66_46_urban_rural"
+    ))
+    
+    # Before fitting the model, assign a unique ID to each row:
+    imputed_df$ID <- seq_len(nrow(imputed_df))
+    
+    # Fit the models on the ith imputed dataset
+    fit1 <- lm(formula1, data = imputed_df)
+    fit2 <- lm(formula2, data = imputed_df)
+    fit3 <- lm(formula3, data = imputed_df)
+    fit4 <- lm(formula4, data = imputed_df)
+    
+    # Run the dfbetas and store the full results.
+    df_b1 <- dfbetas(fit1) 
+    df_b2 <- dfbetas(fit2) 
+    df_b3 <- dfbetas(fit3) 
+    df_b4 <- dfbetas(fit4) 
+    
+    # 0.2 cut-off based on the literature
+    sub.betas_1 = abs(df_b1) > 0.2
+    sub.betas_2 = abs(df_b2) > 0.2
+    sub.betas_3 = abs(df_b3) > 0.2
+    sub.betas_4 = abs(df_b4) > 0.2
+    
+    # Get the *row indices* from sub.betas_1
+    # (If 'df_b1' is a matrix, which(...) returns row & column indices)
+    row_idx_1 <- which(sub.betas_1, arr.ind = TRUE)[,1]
+    row_idx_2 <- which(sub.betas_2, arr.ind = TRUE)[,1]
+    row_idx_3 <- which(sub.betas_3, arr.ind = TRUE)[,1]
+    row_idx_4 <- which(sub.betas_4, arr.ind = TRUE)[,1]
+
+    # Use the stored 'ID' to track the actual row/subject
+    obs_ids_1 <- imputed_df$ID[row_idx_1]
+    obs_ids_2 <- imputed_df$ID[row_idx_2]
+    obs_ids_3 <- imputed_df$ID[row_idx_3]
+    obs_ids_4 <- imputed_df$ID[row_idx_4]
+    
+    # View the extreme dfbetas values and compare
+    dfbetas_1 = df_b1[sub.betas_1]
+    dfbetas_2 = df_b2[sub.betas_2]
+    dfbetas_3 = df_b3[sub.betas_3]
+    dfbetas_4 = df_b4[sub.betas_4]
+    
+    # Create a temporary data frame with the cooks_dist values and observation numbers.
+    tmp <- data.frame(imputation = i,
+                      outcome = y,
+                      df_betas = as.numeric(dfbetas_1),
+                      obs_num = obs_ids_1,
+                      model = rep("y1_avg_temp", length(dfbetas_1)),
+                      stringsAsFactors = FALSE)
+    dfbetas_res_cimt <- rbind(dfbetas_res_cimt, tmp)
+    
+    tmp <- data.frame(imputation = i,
+                      outcome = y,
+                      df_betas = as.numeric(dfbetas_2),
+                      obs_num = obs_ids_2,
+                      model = rep("y1_sd_temp", length(dfbetas_2)),
+                      stringsAsFactors = FALSE)
+    dfbetas_res_cimt <- rbind(dfbetas_res_cimt, tmp)
+    
+    tmp <- data.frame(imputation = i,
+                      outcome = y,
+                      df_betas = as.numeric(dfbetas_3),
+                      obs_num = obs_ids_3,
+                      model = rep("y1_app_temp_avg_46", length(dfbetas_3)),
+                      stringsAsFactors = FALSE)
+    dfbetas_res_cimt <- rbind(dfbetas_res_cimt, tmp)
+    
+    tmp <- data.frame(imputation = i,
+                      outcome = y,
+                      df_betas = as.numeric(dfbetas_4),
+                      obs_num = obs_ids_4,
+                      model = rep("y1_app_temp_sd_46", length(dfbetas_4)),
+                      stringsAsFactors = FALSE)
+    dfbetas_res_cimt <- rbind(dfbetas_res_cimt, tmp)
+    
+  }
+}
+
+#the highest value of df_betas value among all iterations 
+max_values <- dfbetas_res_cimt %>%
+  group_by(outcome) %>%
+  summarize(max_cook = max(df_betas, na.rm = TRUE))
+
+print(max_values)
+
+dfbetas_res_cimt %>%
+  group_by(obs_num) %>%
+  count() %>%
+  filter(n >= (m*2*4)/2)
+
+#Count how often an observation is an influential point from the cook's distance metric
+#100 datasets * 2 outcomes * 4 exposures * 26 dummy var = 20800 max repeats
+dfbetas_res_cimt %>%
+  group_by(obs_num) %>%
+  count()
+```
+
+47 influential observations with DFBetas \>0.2 and occurence \>= 400.
+
+DFBetas plots for the last dataset:
+
+```{r}
+#| eval: false
+#| include: false
+ols_plot_dfbetas(fit1)
+ols_plot_dfbetas(fit2)
+ols_plot_dfbetas(fit3)
+ols_plot_dfbetas(fit4)
+```
+
+# Combining outliers + influential observations
+
+## Blood pressure
+
+First collect unique outliers in the dataframe. Then apply winsorizing to them to the unimputed dataset.
+
+```{r}
+
+#stud_res #outliers
+#cook_res #cooks distance
+#dfbetas_res #dfbetas
+
+#get index of outliers that occur > (number of imp dataset*2*4)/2 times
+st_res_obs_num = stud_res %>%
+  group_by(obs_num) %>%
+  count() %>%
+  filter(n >= (m*2*4)/2) %>%
+  select(-n)
+
+#get index of outliers that occur > (number of imp dataset*2*4)/2 times
+
+cook_obs_num = cook_res %>%
+  group_by(obs_num) %>%
+  count() %>%
+  filter(n >= (m*2*4)/2) %>%
+  select(-n)
+
+#get index of outliers that occur > (number of imp dataset*2*4)/2 times
+
+dfbetas_obs_num = dfbetas_res %>%
+  group_by(obs_num) %>%
+  count() %>%
+  filter(n >= (m*2*4)/2) %>%
+  select(-n)
+
+#unique indexes of influential obs + outliers
+infl_obs_bp = unique(rbind(st_res_obs_num, cook_obs_num, dfbetas_obs_num))
+
+# Extract valid row indices into a vector
+valid_rows <- infl_obs_bp$obs_num
+
+# Extract project IDs corresponding to those row indices in the *imputed* dataset
+# Use complete(...) 'pmm_proj_multiimp' is your mids object.
+bp_proj_id_infl <- complete(pmm_proj_multiimp)[valid_rows, "project_ID"]
+```
+
+## CIMT
+
+The same algorithm:
+
+```{r}
+#| eval: false
+#| include: false
+#stud_res_cimt #outliers
+#cook_res_cimt #cooks distance
+#dfbetas_res_cimt #dfbetas
+
+#get index of outliers that occur > (number of imp dataset*2*4)/2 times
+
+st_res_obs_num_cimt = stud_res_cimt %>%
+  group_by(obs_num) %>%
+  count() %>%
+  filter(n >= (m*2*4)/2) %>%
+  select(-n)
+
+#get index of outliers that occur > (number of imp dataset*2*4)/2 times
+
+cook_obs_num_cimt = cook_res_cimt %>%
+  group_by(obs_num) %>%
+  count() %>%
+  filter(n >= (m*2*4)/2) %>%
+  select(-n)
+
+#get index of outliers that occur > (number of imp dataset*2*4)/2 times
+dfbetas_obs_num_cimt = dfbetas_res_cimt %>%
+  group_by(obs_num) %>%
+  count() %>%
+  filter(n >= (m*2*4)/2) %>%
+  select(-n)
+
+
+#unique indexes of influential obs + outliers
+infl_obs_cimt = unique(rbind(st_res_obs_num_cimt, 
+                             cook_obs_num_cimt, dfbetas_obs_num_cimt))
+
+# Extract valid row indices into a vector
+valid_rows <- infl_obs_cimt$obs_num
+
+# Extract project IDs corresponding to those row indices in the *imputed* dataset
+# Use complete(...) if 'pmm_proj_multiimp' is your mids object.
+cimt_proj_id_infl <- complete(pmm_proj_multiimp_cimt)[valid_rows, "project_ID"]
+```
+
+# Saved mids (multiple imputation) objects
+
+Blood pressure mids object:
+
+```{r}
+#| eval: false
+#| include: false
+###### Save the final dataset with labels ######
+# Define the specific file path 
+file_path <- "//kaappi.oulu.fi/nfbc$/projects/P0511/Alex/2_pmm_proj_multiimp.rds"
+
+# Save
+saveRDS(pmm_proj_multiimp, file_path)
+```
+
+CIMT mids object:
+
+```{r}
+#| eval: false
+#| include: false
+###### Save the final dataset with labels ######
+# Define the specific file path 
+file_path <- "//kaappi.oulu.fi/nfbc$/projects/P0511/Alex/3_pmm_proj_multiimp_cimt.rds"
+
+# Save
+saveRDS(pmm_proj_multiimp_cimt, file_path)
+```
