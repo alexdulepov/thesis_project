@@ -25,7 +25,7 @@ workflow is implemented in R/Quarto notebooks that:
 | `Sensitivity_analysis.qmd` | Quarto notebook that repeats key analyses under alternative assumptions (e.g., complete-case data, transformed outcomes) to assess robustness. |
 
 All notebooks expect the helper script `Functions_rmph.R` (not included in this
-repository) to be available on the working directory or on the R search path.
+repository) to be available on the working directory or on the R search path. The helper script is taken from the "Introduction to Regression Methods for Public Health Using R" (https://www.bookdown.org/rwnahhas/RMPH/).
 
 ## Getting started
 
